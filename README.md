@@ -50,14 +50,17 @@ export OLLAMA_HOST=http://0.0.0.0:11434      # 0.0.0.0 is rewritten to 127.0.0.1
 
 Options: `-C dir` (working directory), `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `--offline`,
 `--resume [id]`, `-y` (auto-approve permission prompts; the hard safety rings stay on), `-v`.
+Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|when|test|start|stop|status`
+(see [Scheduled jobs](#scheduled-jobs)).
 
 ### In the REPL
 
 | | |
 |---|---|
-| `/settings` | **settings menu**: General · Tricks · Theme · Soul. "Harness tricks ›", "Theme ›" and "Soul ›" rows (or keys 1–4, tab) open the other tabs; ↑↓ move, ←→ change, enter select, backspace back, esc save & close |
+| `/settings` | **settings menu**: General · Tricks · Theme · Soul · Schedule. The "›" rows on General (or keys 1–5, tab) open the other tabs; ↑↓ move, ←→ change, enter select, backspace back, esc save & close |
 | `/theme [name]` | pick a theme (↑↓ live preview, enter select, esc cancel) or switch directly. 18 themes in three groups: **Finch** (claude, ocean, forest, dracula, solarized-light, high-contrast, mono), **Hermes Agent** (hermes, ares, poseidon, charizard, slate: Hermes's palettes, glyphs like ☤ and `┊`, and its spinner faces/verbs) and **Editor palettes** (nord, gruvbox, tokyo-night, catppuccin, monokai, rose-pine) |
 | `/soul` | switch persona (interactive Soul tab) · `/soul <name>` · `/soul off` · `/soul list` · `/soul show` · `/soul new <name>` · `/soul edit [name]` |
+| `/schedule` | scheduled jobs (interactive Schedule tab) · `/schedule <when> <task>` · `/schedule new` (guided) · `list` · `run` · `pause` · `resume` · `rm` · `log` · `when <job> <when>` · `daemon start\|stop\|status` |
 | `/tricks` | interactive trick toggles · `/tricks list` prints them · `/tricks <key> on\|off` · `/tricks all off` for a raw model |
 | `/model [name]` | pick or switch model (shows size + tools/thinking/vision capabilities) |
 | `/think on\|off\|auto` | thinking tri-state (`auto` = don't send the field; model default) |
@@ -129,6 +132,46 @@ Be direct: match the length of your reply to the weight of the ask…
 Every character is sent with every request, so the picker shows each soul's token cost. Souls are capped at
 4,000 characters. Editing a built-in soul copies it to `~/.finch/souls/` first.
 
+## Scheduled jobs
+
+Finch can run a task later, once or on a schedule. A job is a task, a folder and a schedule:
+
+```text
+/schedule in 10m remind me to stretch
+/schedule every weekday at 8:30 summarise yesterday's commits in this repo into standup.md
+/schedule friday at 17:00 -- tidy the downloads folder        (" -- " separates schedule and task explicitly)
+finch schedule add "daily at 9am" "check the build and write status.md" -C ~/proj
+```
+
+| Schedule | Examples |
+|---|---|
+| one-off | `in 10m` · `in 1h30m` · `at 17:30` · `5pm` · `tomorrow 9am` · `friday at 08:15` · `oct 20 at 9am` · `2026-10-20 09:00` |
+| recurring | `every 30m` · `every 2 hours` · `hourly` · `daily at 9am` · `weekdays at 8:30` · `weekends at 10am` · `every mon, wed and fri at 7pm` · `weekly on friday at 5pm` · `monthly on the 1st at 9am` |
+| cron | `cron 0 9 * * 1-5` or any bare 5-field expression (names, ranges, lists and steps work) |
+
+Times are local. A time of day that has already passed means tomorrow, and a day without a time means 09:00.
+`finch schedule test "<phrase>"` (or the live preview in `/schedule new`) shows how a phrase is read and its next runs.
+
+**Managing jobs.** Use the Schedule tab in `/settings` (key 5) or `/schedule` with no arguments. It lists every job with its
+next run and last result. Enter on a job opens: run now, pause/resume, view last log, edit task, change schedule, change
+folder, toggle auto-approve, delete. "Background daemon" switches the daemon on and off.
+
+**How jobs run.** A due job runs headless, exactly like `finch -p "<task>" -C <folder>`, with your current settings
+(model, soul, tricks), a 30-minute timebox and a 2-hour hard limit. Output goes to `~/.finch/schedule/logs/<job>/`
+(the last 30 runs are kept). When a job finishes, the next prompt in any open Finch window shows its result, and the
+status bar shows the next or running job.
+
+- **Who runs them:** any open Finch window checks every 15 s. To run jobs with no window open, start the daemon:
+  `finch schedule start` (or the toggle in the Schedule tab). Windows and the daemon can all be active: a job is
+  claimed under a file lock, and **only one job runs at a time** so jobs don't fight over the GPU.
+- **While you work:** a due job waits until your current task in a Finch window finishes (at most 30 minutes).
+- **Missed runs:** a recurring job that was missed runs once on catch-up, then continues from now (no backfill). A one-off
+  job runs late if it's less than 24 hours overdue, otherwise it's marked missed.
+- **Safety:** nobody is there to answer permission prompts, so risky actions (installs, deletes outside the project,
+  system changes) are **denied** unless the job has auto-approve on. The hard safety ring is always on.
+- **WSL:** the daemon only runs while the WSL VM is up. If Windows shuts WSL down when no terminal is open, jobs wait
+  until a window or the daemon is running again (then the catch-up rules above apply).
+
 ## Toggleable tricks
 
 Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 32 of them in 7 groups) that
@@ -166,5 +209,6 @@ MCP (`~/.finch/mcp.json`):
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests
 ```
 
-The suite includes a scripted fake model that drives the full loop through the finish gates, the
+132 tests, no backend needed. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
+prints the screen (see its docstring). The suite includes a scripted fake model that drives the full loop through the finish gates, the
 anti-loop ladder, the empty-turn ladder and the chat mode. It doesn't need a running backend.

@@ -40,13 +40,16 @@ Useful flags: `-C dir`, `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `
 | `finch/cli.py` | REPL, slash commands, `@file` mentions, `!shell`, headless mode. |
 | `finch/tricks.py` | Registry of the 32 toggleable tricks (key, group, label, description) and ablation aliases. |
 | `finch/themes.py` | 7 colour themes: rich styles + prompt_toolkit styles, swatch helpers. |
-| `finch/settings_menu.py` | `/settings`: inline prompt_toolkit app with General · Tricks · Theme · Soul tabs. |
+| `finch/settings_menu.py` | `/settings`: inline prompt_toolkit app with General · Tricks · Theme · Soul · Schedule tabs, plus the job wizard and `choose()` picker. |
+| `finch/scheduler.py` | Task scheduler: schedule phrase parser + 5-field cron engine, file-locked job store (`~/.finch/schedule/jobs.json`), runner `tick()`, per-run supervisor (`finch schedule exec`), daemon, `finch schedule …` CLI. |
 | `finch/souls.py`, `finch/builtin_souls/` | SOUL.md personas: discovery (project > user > built-in), frontmatter parsing, create/edit, injection text. |
 | `finch/skills/*.md` | Built-in skills: bug_fix, test_driven, python_project, web_research, data_analysis, code_review. |
-| `tests/test_harness.py` | 44 tests, including a scripted `FakeLLM` that drives the full loop. |
+| `scripts/pty_drive.py` | Dev tool: drives the REPL in a pty (pexpect + pyte, answers CPR) and prints the screen. Use it to verify menus/toolbars. |
+| `CLAUDE.md` | Local only (gitignored). Short orientation for Claude: commands, layout, invariants, gotchas, how this user works. |
+| `tests/test_harness.py` | 132 tests, including a scripted `FakeLLM` that drives the full loop. |
 
 Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `mcp.json`, `skills/`,
-`cache/` and `history`. Per-workdir state lives in `<workdir>/.finch/`: `backups/`, `trash/` and `sources/` (fetched web pages).
+`cache/`, `history` and `schedule/` (jobs.json, logs/, daemon.pid, daemon.log, busy/). Per-workdir state lives in `<workdir>/.finch/`: `backups/`, `trash/` and `sources/` (fetched web pages).
 
 ## 3. Mingbird mechanisms → Finch
 
@@ -151,7 +154,61 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
 - Verified: 93 tests pass. Terminal walkthrough of the Soul tab, `/soul new|list|<name>` and creating a soul from the menu.
   gemma4:12b with the pirate soul answered "Ahoy there, matey! I be Finch…".
 
+### Follow-up: repo restore
+
+- The `finch/` package directory had been replaced by a clone of `github.com/EonBoop/Finch` (only `.git`, `LICENSE`,
+  `README.md`). Finch's own agent was not involved (that session only ran `git remote -v` and `git branch`).
+- Rebuilt by replaying every Write/Edit/patch-script from the Claude Code session transcript into a staging dir. Verified:
+  README, NOTES and pyproject.toml matched the surviving copies byte for byte, and all 93 tests passed.
+- The git repo was moved from the package dir to the project root (`LICENSE` to the root, the repo's README tagline merged
+  into README.md, `.gitignore` added) and committed as `d67560b` on top of "Initial commit". Not pushed.
+
+### Follow-up: task scheduler
+
+- `finch/scheduler.py` (no UI) plus UI in cli.py / settings_menu.py. One-off and recurring jobs; schedule phrases are parsed
+  to `once` (timestamp), `interval` (seconds) or `cron` (5-field, own engine, dom/dow OR-semantics like cron).
+- Design choices:
+  - Jobs run as `finch -p` subprocesses, so they get the full harness and headless mode's unattended safety
+    (risky actions denied unless the job has `yes`).
+  - Every run has its own supervisor process (`python -I -m finch schedule exec <id>`, new session). It enforces the
+    hard timeout (killpg), writes the log and records the result, so closing the window that launched it doesn't
+    orphan the record.
+  - Runners (any REPL's background thread every 15 s, and/or the daemon) only call `tick()`. That claims the next
+    due job under an `fcntl` lock on `schedule/.lock` and starts nothing while any job is running, so there are no
+    double runs and only one job runs at a time across processes.
+  - A dead runner's pid gets the job marked `interrupted` (zombies count as dead via /proc state).
+  - Interactive tasks write `schedule/busy/<pid>`, and due jobs wait for them (max 30 min).
+  - Missed runs: recurring jobs catch up once, then re-anchor to now. One-offs run if less than 24 h late, else
+    they're marked `missed`.
+- UI:
+  - The Schedule tab (tab 5) has "New scheduled job…" (wizard with a live preview of the next runs in the bottom
+    toolbar), a Background daemon toggle, and job rows. Enter on a row opens the actions picker (`choose()` helper).
+  - `/schedule` commands: `<when> <task>` splits on the longest leading phrase that parses, or on ` -- `.
+  - The toolbar shows "⏰ next/running job · N new results". Finished-job notices with the last output lines
+    appear before the next prompt. `/status` has a scheduler line.
+- Bugs found while testing:
+  - `python -m finch` puts the cwd on sys.path. Started from `~/workspace`, it imported the project folder `finch/`
+    as a namespace package and crashed. All spawned processes now use `python -I`, and the daemon runs with
+    `cwd=~/.finch/schedule`.
+  - **Pre-existing:** `main()` set `PROMPT_TOOLKIT_NO_CPR=1` (added earlier to silence a CPR warning under pyte).
+    prompt_toolkit only draws bottom toolbars once the renderer height is known, which needs CPR, so **the REPL
+    status bar was never visible**. Removed. The pty driver now answers CPR like a real terminal.
+  - ui.notice truncates long messages at the first ":" past 160 chars, which cut times like 13:44. Scheduler messages
+    are now short, with details on a dim second line.
+- Verified:
+  - 132 tests pass (39 new: phrase parsing, cron edge cases incl. leap day/year rollover/dom-dow OR, split, store
+    lifecycle, tick claiming/serialisation/reaping/missed/busy deferral/run-now, real supervisor execution ok/failed/
+    timeout, CLI dispatch).
+  - Live with gemma4:12b: `finch schedule run` wrote stamp.txt. The daemon ran a 2-minute recurring job and a one-off
+    poem job in order (the one-off waited for the running job).
+  - pty walkthrough: `/schedule <when> <task>`, list, Schedule tab, the job actions picker, the wizard with live
+    preview and error, and result notices appearing in the REPL while the daemon was also running.
+
 ## 6. Ideas / open items
+
+- Scheduler: desktop notifications on job completion (notify-send / Windows toast from WSL); an agent tool so the model can
+  schedule follow-ups itself; per-job model pinning in the wizard; check whether WSL keeps the daemon alive after the last
+  terminal closes (untested; Windows Task Scheduler running `wsl … finch schedule tick` is a possible fallback).
 
 - Port parallel sub-agent dispatch: a sandboxed child process per simple todo item, with fallback to running serially.
 - Esc-to-interrupt (currently Ctrl+C) and expandable tool output (currently `/verbose`).

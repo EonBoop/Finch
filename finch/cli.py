@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from . import __version__, config, heuristics as H, souls, themes, tools as T, tricks as TR
+from . import __version__, config, heuristics as H, scheduler as SCH, souls, themes, tools as T, tricks as TR
 from .agent import Agent, Session
 from .llm import make_backend
 from .mcp import MCPManager
@@ -26,6 +26,7 @@ COMMANDS = {
     "/theme": "pick a theme (live preview), or /theme dracula",
     "/soul": "switch persona (interactive) · /soul <name> · off · list · show · new <name> · edit",
     "/tricks": "toggle harness tricks (interactive), /tricks list, or /tricks crawl_guard off",
+    "/schedule": "scheduled jobs (interactive) · /schedule <when> <task> · list · new · run · pause · resume · rm · log",
     "/model": "list models or switch: /model gemma4:12b",
     "/think": "thinking: /think on | off | auto",
     "/ctx": "context window: /ctx 65536",
@@ -110,6 +111,8 @@ class App:
         self.agent = Agent(self.s, self.backend, self.tb, self.gate, self.ui, self.mcp)
         if args.timebox:
             self.agent.timebox_min = H.parse_duration(args.timebox)
+        self._sched_stop = self._sched_wake = None
+        self._sched_seen, self._sched_cache = {}, (0, [])
         if args.resume:
             self.resume(args.resume, quiet=self.headless)
         else:
@@ -418,6 +421,8 @@ class App:
                 ui.notice(f"unknown theme '{arg}'. Themes: {', '.join(themes.THEMES)}", "error")
         elif cmd == "/soul":
             self.soul_command(arg)
+        elif cmd == "/schedule":
+            self.schedule_command(arg)
         elif cmd == "/tricks":
             a = arg.split()
             if not a:
@@ -451,7 +456,8 @@ class App:
                 f"context {used}/{s.num_ctx} ({used * 100 // max(1, s.num_ctx)}%) · output cap {s.num_predict} · "
                 f"think {s.think} · temp {s.temperature} · keep_alive {s.keep_alive}\n"
                 f"workdir {self.tb.workdir} · session {self.agent.session.id} ({len(self.agent.session.messages)} msgs)\n"
-                f"soul {s.soul or 'none'} · offline {s.offline} · unsafe {s.unsafe} · timebox {self.agent.timebox_min} · mode {self.agent.force_mode or 'auto'}",
+                f"soul {s.soul or 'none'} · offline {s.offline} · unsafe {s.unsafe} · timebox {self.agent.timebox_min} · mode {self.agent.force_mode or 'auto'}\n"
+                f"scheduler: {len(SCH.load_jobs())} job(s) · {SCH.runner_text()}",
                 style="dim"))
         elif cmd == "/init":
             p = os.path.join(self.tb.workdir, "FINCH.md")
@@ -476,12 +482,162 @@ class App:
         self.agent.session.messages.append({"role": "user", "content":
             f"[harness] The user ran a shell command.\n$ {cmd}\n[exit {rc}]\n{out[-3000:]}"})
 
+    # ---------------- scheduler ----------------
+    def start_scheduler(self):
+        """Run due jobs from this window while it is open (any number of runners is safe)."""
+        self._sched_stop, self._sched_wake = threading.Event(), threading.Event()
+        self._sched_seen = {j["id"]: j.get("last_finished") for j in SCH.load_jobs()}
+
+        def loop():
+            while not self._sched_stop.is_set():
+                try:
+                    SCH.tick()
+                except Exception:
+                    pass
+                self._sched_wake.wait(SCH.TICK)
+                self._sched_wake.clear()
+        threading.Thread(target=loop, name="finch-scheduler", daemon=True).start()
+
+    def kick_scheduler(self):
+        if self._sched_wake:
+            self._sched_wake.set()
+
+    def _jobs_cached(self):
+        t, jobs = self._sched_cache
+        if time.time() - t > 3:
+            jobs = SCH.load_jobs()
+            self._sched_cache = (time.time(), jobs)
+        return jobs
+
+    def _new_results(self, jobs):
+        return [j for j in jobs if j.get("last_finished") and not j.get("running")
+                and j.get("last_finished") != self._sched_seen.get(j["id"])]
+
+    def sched_flag(self):
+        jobs = self._jobs_cached()
+        if not jobs:
+            return ""
+        run = next((j for j in jobs if j.get("running")), None)
+        new = self._new_results(jobs)
+        if run:
+            out = f"⏰ running {run['name']}"
+        else:
+            nxt = sorted((j for j in jobs if j["enabled"] and j.get("next_run")), key=lambda j: j["next_run"])
+            out = f"⏰ {nxt[0]['name']} {SCH.fmt_time(nxt[0]['next_run'])}" if nxt else ""
+        if new:
+            out += f" · {len(new)} new result{'s' if len(new) > 1 else ''}"
+        return out
+
+    def show_job_results(self):
+        jobs = SCH.load_jobs()
+        for j in self._new_results(jobs):
+            self._sched_seen[j["id"]] = j["last_finished"]
+            lvl = {"ok": "ok", "failed": "error", "timeout": "error"}.get(j["last_status"], "warn")
+            took = f" · {SCH.fmt_dur(j['last_duration'])}" if j.get("last_duration") else ""
+            self.ui.notice(f"⏰ job '{j['name']}' {j['last_status']}{took} · /schedule log {j['name']}", lvl)
+            if j.get("last_summary"):
+                self.console.print(Text("\n".join("    " + ln for ln in j["last_summary"].splitlines()[-6:]), style="dim"))
+        self._sched_cache = (0, [])
+
+    def show_jobs(self):
+        jobs = SCH.load_jobs()
+        if not jobs:
+            self.ui.notice("no scheduled jobs. /schedule <when> <task>, e.g. /schedule every day at 9am summarise ~/notes", "info")
+        else:
+            t = Table(box=None, padding=(0, 2), header_style="dim")
+            for c in ("#", "name", "schedule", "state", "last run", ""):
+                t.add_column(c)
+            for i, j in enumerate(jobs, 1):
+                st = SCH.state_text(j)
+                t.add_row(str(i), Text(j["name"], style="bold"), j["desc"],
+                          Text(st, style="dim" if st in ("paused", "done", "missed") else "accent"),
+                          SCH.last_text(j), Text("auto-approve" if j.get("yes") else "", style="warn"))
+            self.console.print(t)
+        self.console.print(Text("  " + SCH.runner_text(), style="dim"))
+
+    def schedule_command(self, arg):
+        ui = self.ui
+        sub, _, rest = arg.strip().partition(" ")
+        sub, rest = sub.lower(), rest.strip()
+        try:
+            if not arg.strip():
+                self.open_settings(tab=4)
+            elif sub in ("list", "ls"):
+                self.show_jobs()
+            elif sub in ("help", "?"):
+                self.console.print(Text(
+                    "  /schedule                      interactive job manager (Settings › Schedule)\n"
+                    "  /schedule <when> <task>        add a job, e.g. /schedule every weekday at 8:30 summarise new commits\n"
+                    "  /schedule <when> -- <task>     same, with an explicit separator\n"
+                    "  /schedule new                  guided: when (live preview), task, folder, auto-approve\n"
+                    "  /schedule list                 all jobs\n"
+                    "  /schedule run|pause|resume|rm|log <job>\n"
+                    "  /schedule when <job> <when>    change a job's schedule\n"
+                    "  /schedule daemon start|stop|status   run jobs with no Finch window open\n\n"
+                    "  when: in 10m · at 17:30 · tomorrow 9am · friday at 8am · oct 20 at 9am · every 30m · hourly ·\n"
+                    "        daily at 9am · weekdays at 8:30 · every mon, wed and fri at 7pm · monthly on the 1st · cron 0 9 * * 1-5",
+                    style="dim"))
+            elif sub == "new":
+                from .settings_menu import new_job_wizard
+                self.console.print(Text("  " + new_job_wizard(self), style="ok"))
+                self.kick_scheduler()
+            elif sub in ("run", "pause", "resume", "rm", "delete", "log", "when") and not rest:
+                ui.notice(f"usage: /schedule {sub} <job>" + (" <when>" if sub == "when" else ""), "error")
+            elif sub == "run":
+                j = SCH.request_run(rest)
+                self.kick_scheduler()
+                ui.notice(f"⏰ '{j['name']}' queued to run now; you'll see the result here when it finishes", "ok")
+            elif sub in ("pause", "resume"):
+                j = SCH.set_enabled(rest, sub == "resume")
+                ui.notice(f"'{j['name']}' {'resumed · ' + SCH.state_text(j) if j['enabled'] else 'paused'}", "ok")
+            elif sub in ("rm", "delete"):
+                ui.notice(f"deleted '{SCH.remove(rest)['name']}'", "ok")
+            elif sub == "log":
+                j = SCH.find(rest)
+                if not j:
+                    raise ValueError(f"no job '{rest}'")
+                if not j.get("last_log"):
+                    ui.notice(f"'{j['name']}' has not run yet", "info")
+                else:
+                    self.console.print(Text(SCH.tail(j["last_log"], 80).rstrip(), style="output"))
+                    self.console.print(Text(f"  {j['last_log']}", style="dim"))
+            elif sub == "when":
+                ref, _, when = rest.partition(" ")
+                j = SCH.reschedule(ref, when)
+                ui.notice(f"'{j['name']}' · {j['desc']} · next {SCH.fmt_time(j['next_run'])}", "ok")
+            elif sub == "daemon":
+                if rest == "start":
+                    ui.notice(SCH.start_daemon()[1], "ok")
+                elif rest == "stop":
+                    ui.notice(SCH.stop_daemon(), "ok")
+                else:
+                    ui.notice(SCH.runner_text(), "info")
+            else:
+                text = rest if sub == "add" else arg.strip()
+                when, task = SCH.split_when(text)
+                if not task:
+                    raise ValueError("what should Finch do? e.g. /schedule in 10m remind me to stretch")
+                j = SCH.add_job(when, task, self.tb.workdir)
+                ui.notice(f"⏰ scheduled '{j['name']}' · {j['desc']}", "ok")
+                self.console.print(Text(
+                    f"    first run {SCH.fmt_time(j['next_run'])} · task: {task[:80]}"
+                    f" · folder: {self.tb.workdir.replace(os.path.expanduser('~'), '~')}\n"
+                    + ("    runs while a Finch window is open; /schedule daemon start runs jobs without one"
+                       if not SCH.daemon_pid() else "    the background daemon will run it"), style="dim"))
+                self.kick_scheduler()
+        except ValueError as e:
+            ui.notice(str(e), "error")
+        self._sched_cache = (0, [])
+
     # ---------------- main loops ----------------
     def run_task(self, text):
         text, images = expand_mentions(text, self.tb.workdir)
         cancel = threading.Event()
         try:
-            return self.agent.run_turn(text, images=images, cancel=cancel)
+            if self.headless:
+                return self.agent.run_turn(text, images=images, cancel=cancel)
+            with SCH.busy():                  # scheduled jobs wait while you work (one GPU)
+                return self.agent.run_turn(text, images=images, cancel=cancel)
         except KeyboardInterrupt:
             self.ui.abort()
             return None
@@ -493,6 +649,8 @@ class App:
         used = self.agent.last_ctx
         pct = used * 100 // max(1, s.num_ctx)
         wd = self.tb.workdir.replace(os.path.expanduser("~"), "~")
+        if len(wd) > 32:
+            wd = "…/" + "/".join(wd.rstrip("/").split("/")[-2:])
         flags = []
         if s.offline:
             flags.append("offline")
@@ -507,13 +665,15 @@ class App:
             flags.append(f"mode:{self.agent.force_mode}")
         if s.soul:
             flags.append(f"soul:{s.soul}")
+        sched = self.sched_flag()
         think = {None: "auto", True: "on", False: "off"}[s.think]
         ctxc = "tberr" if pct >= 75 else ("tbwarn" if pct >= 60 else "tbdim")
         from prompt_toolkit.formatted_text import HTML
         from html import escape
         return HTML(f" <tbbold>{escape(s.model or '-')}</tbbold> · <{ctxc}>ctx {used / 1000:.1f}K/{s.num_ctx // 1024}K ({pct}%)</{ctxc}>"
-                    f" · think {think} · {escape(wd)}" + (f" · <tbwarn>{escape(' · '.join(flags))}</tbwarn>" if flags else "")
-                    + "   <tbdim>/settings · /help · ctrl+d quit</tbdim>")
+                    f" · think {think}" + (f" · <tbbold>{escape(sched)}</tbbold>" if sched else "")
+                    + (f" · <tbwarn>{escape(' · '.join(flags))}</tbwarn>" if flags else "")
+                    + f" · {escape(wd)}   <tbdim>/settings · /help · ctrl+d quit</tbdim>")
 
     def open_settings(self, tab=0):
         from .settings_menu import SettingsMenu
@@ -564,7 +724,8 @@ class App:
         style = DynamicStyle(lambda: Style.from_dict(themes.pt_style_dict(self.s.theme)))
         ps = PromptSession(history=FileHistory(config.HISTORY_FILE), completer=FinchCompleter(),
                            key_bindings=kb, complete_while_typing=True, style=style,
-                           bottom_toolbar=self.toolbar, prompt_continuation=lambda w, n, s: "  ")
+                           bottom_toolbar=self.toolbar, prompt_continuation=lambda w, n, s: "  ",
+                           refresh_interval=5)
         backend_ver = "?"
         try:
             backend_ver = self.backend.version()
@@ -572,8 +733,10 @@ class App:
             pass
         banner(self.console, self.s, self.s.model, self.tb.workdir, __version__, backend_ver)
         self.ensure_model()
+        self.start_scheduler()
         last_ctrl_c = 0
         while True:
+            self.show_job_results()
             try:
                 self.console.print(Text("─" * self.console.size.width, style="rule"))
                 line = ps.prompt(lambda: [("class:prompt", themes.glyph(self.s.theme, "prompt") + " ")])
@@ -600,6 +763,8 @@ class App:
                     continue
             self.run_task(line)
         self.mcp.close()
+        if self._sched_stop:
+            self._sched_stop.set()
         self.console.print(Text("bye 👋", style="dim"))
 
     def headless_run(self, task):
@@ -615,7 +780,6 @@ class App:
 
 
 def main(argv=None):
-    os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
     ap = argparse.ArgumentParser(prog="finch", description="A local-first agent harness for small models.")
     ap.add_argument("-p", "--print", metavar="TASK", help="run one task headless and exit")
     ap.add_argument("-m", "--model")
@@ -631,6 +795,9 @@ def main(argv=None):
     ap.add_argument("--theme", choices=list(themes.THEMES))
     ap.add_argument("--soul", help="persona to use (name from /soul list, or 'none')")
     ap.add_argument("--version", action="version", version=f"finch {__version__}")
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["schedule"]:
+        sys.exit(SCH.cli_main(argv[1:]))
     args = ap.parse_args(argv)
     app = App(args)
     if args.print:

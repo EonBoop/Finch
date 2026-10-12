@@ -1,6 +1,6 @@
 """/settings: an inline, keyboard-driven settings menu (prompt_toolkit Application).
 
-Tabs: General · Tricks · Theme.  ↑/↓ move · ←/→ change · space/enter toggle or edit ·
+Tabs: General · Tricks · Theme · Soul · Schedule.  ↑/↓ move · ←/→ change · space/enter toggle or edit ·
 tab switch tabs · esc/q save & close. Changes apply live and are persisted on close."""
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -12,9 +12,9 @@ from prompt_toolkit.styles import Style
 import os
 import subprocess
 
-from . import config, souls, themes, tricks as TR
+from . import config, scheduler as SCH, souls, themes, tricks as TR
 
-TABS = ("General", "Tricks", "Theme", "Soul")
+TABS = ("General", "Tricks", "Theme", "Soul", "Schedule")
 
 
 class Item:
@@ -43,9 +43,10 @@ class SettingsMenu:
         self.app = app                      # cli.App
         self.s = app.s
         self.tab = 0
-        self.cursor = {0: 0, 1: 0, 2: 0, 3: 0}
+        self.cursor = {i: 0 for i in range(len(TABS))}
         self.edit_request = None
         self.soul_request = None
+        self.sched_request = None
         self.flash = ""
         try:
             self.models = app.backend.list_models()
@@ -68,6 +69,8 @@ class SettingsMenu:
                  desc="Pick a colour theme with live preview. Enter to open (or press 3)."),
             Item("_nav_soul", "Soul", "nav", lambda: s.soul or "none", target=3,
                  desc="Switch the SOUL.md persona injected into every system prompt. Enter to open (or press 4)."),
+            Item("_nav_sched", "Scheduled jobs", "nav", self._sched_summary, target=4,
+                 desc="One-off and recurring jobs Finch runs on its own. Enter to open (or press 5)."),
             Item("_h_general", "General", "header", lambda: None),
             Item("model", "Model", "choice", lambda: s.model, set_model, self.models,
                  "Model used for new turns. ←/→ to cycle through installed models."),
@@ -156,6 +159,39 @@ class SettingsMenu:
                             desc=f"{sl['desc']}  ·  {sl['scope']} · ~{sl['tokens']} tokens per request · {sl['path']}"))
         return out
 
+    def _sched_summary(self):
+        jobs = SCH.load_jobs()
+        n_on = sum(1 for j in jobs if j["enabled"] and j.get("next_run"))
+        return f"{len(jobs)} job{'s' if len(jobs) != 1 else ''}" + (f", {n_on} active" if jobs else "")
+
+    def schedule_items(self):
+        jobs = SCH.load_jobs()
+        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=0,
+                    desc="Return to the General tab (or backspace / 1).")
+        out = [back,
+               Item("_sched_new", "New scheduled job…", "action", lambda: None, lambda v: self._sched_req("new"),
+                    desc="Choose when (one-off or recurring, with a live preview of the next runs), what Finch should "
+                         "do, and the folder. Jobs run headless and keep a log of every run."),
+               Item("_sched_daemon", "Background daemon", "bool", lambda: bool(SCH.daemon_pid()), self._toggle_daemon,
+                    desc="On: jobs run even when no Finch window is open (same as `finch schedule start`). "
+                         "Off: jobs run only while a Finch window is open. Only one job runs at a time either way."),
+               Item("_h_jobs", f"Jobs ({len(jobs)})  ·  enter on a job for actions" if jobs
+                    else "No jobs yet: create one above, or type /schedule <when> <task>", "header", lambda: None)]
+        for j in jobs:
+            flags = " · auto-approve" if j.get("yes") else ""
+            last = j.get("last_summary", "").strip().splitlines()
+            out.append(Item(j["id"], j["name"], "job", lambda: None,
+                            desc=f"{j['prompt'][:160]}  ·  {j['workdir'].replace(os.path.expanduser('~'), '~')}{flags}"
+                                 + (f"\n  last output: {last[-1][:150]}" if last else "")))
+        return out
+
+    def _toggle_daemon(self, on):
+        self.flash = SCH.start_daemon()[1] if on else SCH.stop_daemon()
+
+    def _sched_req(self, kind, jid=None):
+        self.sched_request = (kind, jid)
+        self.application.exit(result="sched")
+
     def _soul_req(self, kind):
         self.soul_request = kind
         self.application.exit(result="soul")
@@ -166,7 +202,7 @@ class SettingsMenu:
         self.flash = "all tricks " + ("enabled" if on else "disabled")
 
     def items(self):
-        return (self.general_items, self.trick_items, self.theme_items, self.soul_items)[self.tab]()
+        return (self.general_items, self.trick_items, self.theme_items, self.soul_items, self.schedule_items)[self.tab]()
 
     # ---------------- rendering ----------------
     def _selectable(self, items):
@@ -212,7 +248,7 @@ class SettingsMenu:
         if self.flash:
             out.append(("class:sm.value", "  " + self.flash + "\n"))
         out.append(("class:sm.help", "  ↑↓ move · ←→ change · enter select/open · 1 General · 2 Tricks · 3 Theme · 4 Soul · "
-                                     "tab next tab · esc save & close"))
+                                     "5 Schedule · tab next tab · esc save & close"))
         return out
 
     def _value_frag(self, it):
@@ -230,6 +266,16 @@ class SettingsMenu:
             meta = f"  {info['scope']} · ~{info['tokens']} tok" if info else "  0 tok"
             mark = [("class:sm.on", "  ✓ active")] if (it.get() or "") == it.key else []
             return [("class:sm.desc", meta)] + mark
+        if it.kind == "job":
+            j = SCH.find(it.key)
+            if not j:
+                return [("", "")]
+            st, last = SCH.state_text(j), SCH.last_text(j)
+            lcls = ("class:sm.on" if j.get("last_status") == "ok" else
+                    "class:sm.off" if j.get("last_status") in ("failed", "timeout", "interrupted") else "class:sm.desc")
+            return [("class:sm.value", f"{j['desc'][:34]:<36}"),
+                    ("class:sm.desc" if st in ("paused", "done", "missed") else "class:sm.on", f"{st:<22}"),
+                    (lcls, last)]
         if it.kind == "theme":
             sw = [(st, "■ ") for st in themes.swatch(it.key)]
             mark = [("class:sm.on", "  ✓ current")] if it.get() == it.key else []
@@ -259,6 +305,8 @@ class SettingsMenu:
             it.set(None)
         elif it.kind == "nav" and (activate or (step > 0 and it.target) or (step < 0 and not it.target)):
             self.goto(it.target)
+        elif it.kind == "job" and activate:
+            self._sched_req("job", it.key)
         elif it.kind == "soul" and (activate or step):
             it.set(it.key)
             self.flash = f"soul set to {it.key or 'none'}"
@@ -351,6 +399,12 @@ class SettingsMenu:
             self.edit_request = None
             self.soul_request = None
             res = self.application.run()
+            if res == "sched":
+                kind, jid = self.sched_request
+                self.flash = new_job_wizard(self.app) if kind == "new" else job_actions(self.app, jid)
+                if hasattr(self.app, "kick_scheduler"):
+                    self.app.kick_scheduler()
+                continue
             if res == "soul":
                 self._handle_soul_request()
                 continue
@@ -479,3 +533,185 @@ def pick_theme(app):
     app.apply_theme(choice)
     config.save_settings(app.s)
     return choice
+
+
+def choose(app, title, options, hint="↑↓ move · enter select · esc cancel"):
+    """Small inline picker. options: [(key, label)] -> chosen key or None."""
+    state = {"i": 0}
+
+    def render():
+        out = [("class:sm.title", f" {title} "), ("", "\n"), ("class:sm.desc", f"  {hint}\n\n")]
+        for i, (_, label) in enumerate(options):
+            sel = i == state["i"]
+            out += [("class:sm.cursor", " ❯ " if sel else "   "),
+                    ("class:sm.selected" if sel else "class:sm.label", label), ("", "\n")]
+        return out
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _(e):
+        state["i"] = (state["i"] - 1) % len(options)
+
+    @kb.add("down")
+    @kb.add("j")
+    def _(e):
+        state["i"] = (state["i"] + 1) % len(options)
+
+    @kb.add("enter")
+    @kb.add("space")
+    def _(e):
+        e.app.exit(result=options[state["i"]][0])
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _(e):
+        e.app.exit(result=None)
+
+    application = Application(
+        layout=Layout(HSplit([Window(FormattedTextControl(render, focusable=True, show_cursor=False),
+                                     height=Dimension(min=len(options) + 4), wrap_lines=True)])),
+        key_bindings=kb, style=Style.from_dict(themes.pt_style_dict(app.s.theme)),
+        full_screen=False, erase_when_done=True)
+    application.ttimeoutlen = 0.05
+    return application.run()
+
+
+def _ask(app, label, default="", validator=None, toolbar=None):
+    """One prompt_toolkit question in the current theme. Raises EOFError/KeyboardInterrupt on cancel."""
+    from prompt_toolkit import prompt
+    return prompt(f"  {label} › ", default=default, validator=validator, validate_while_typing=False,
+                  bottom_toolbar=toolbar, style=Style.from_dict(themes.pt_style_dict(app.s.theme))).strip()
+
+
+def _when_tools():
+    from prompt_toolkit.application.current import get_app
+    from prompt_toolkit.validation import ValidationError, Validator
+
+    def preview():
+        txt = get_app().current_buffer.text
+        if not txt.strip():
+            return " e.g. in 10m · tomorrow 9am · friday at 17:00 · every 2h · daily at 9am · weekdays at 8:30 · cron 0 9 * * 1-5"
+        try:
+            sp = SCH.parse_when(txt)
+            return " → " + sp["desc"] + " · next: " + ", ".join(SCH.fmt_time(t) for t in SCH.upcoming(sp))
+        except ValueError as e:
+            return " ✗ " + str(e)
+
+    class WhenValidator(Validator):
+        def validate(self, doc):
+            if doc.text.strip():
+                try:
+                    SCH.parse_when(doc.text)
+                except ValueError as e:
+                    raise ValidationError(message=str(e))
+    return preview, WhenValidator()
+
+
+def new_job_wizard(app):
+    """Guided job creation. Returns a status message."""
+    from prompt_toolkit.validation import Validator
+    preview, when_v = _when_tools()
+    try:
+        when = _ask(app, "When? (one-off or recurring)", validator=when_v, toolbar=preview)
+        if not when:
+            return "cancelled"
+        task = _ask(app, "What should Finch do?",
+                    toolbar=lambda: " Runs headless like `finch -p`: describe the task and where the result should go "
+                                    "(a file, a summary...)")
+        if not task:
+            return "cancelled"
+        isdir = Validator.from_callable(lambda t: os.path.isdir(os.path.expanduser(t.strip() or ".")),
+                                        error_message="no such directory")
+        wd = _ask(app, "Working directory", default=app.tb.workdir, validator=isdir)
+        yes = _ask(app, "Auto-approve risky actions? [y/N]",
+                   toolbar=lambda: " No (default): installs, deletes outside the project, etc. are denied, because "
+                                   "nobody is there to confirm. The hard safety ring is always on.").lower()
+        j = SCH.add_job(when, task, wd or app.tb.workdir, yes=yes.startswith("y"))
+    except (EOFError, KeyboardInterrupt):
+        return "cancelled"
+    except ValueError as e:
+        return f"not scheduled: {e}"
+    msg = f"⏰ scheduled '{j['name']}' · {j['desc']} · next {SCH.fmt_time(j['next_run'])}"
+    if not SCH.daemon_pid():
+        msg += " · runs while a Finch window is open (or turn on the background daemon)"
+    return msg
+
+
+def _view_log(path):
+    import shutil
+    pager = os.environ.get("PAGER") or ("less" if shutil.which("less") else "")
+    if pager:
+        cmd = pager.split() + (["+G"] if pager.split()[0] == "less" else []) + [path]
+        subprocess.call(cmd)
+        return f"log: {path}"
+    print(SCH.tail(path, 80))
+    try:
+        input("  (enter to return) ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return f"log: {path}"
+
+
+def job_actions(app, jid):
+    """Enter on a job in the Schedule tab. Returns a status message."""
+    j = SCH.find(jid)
+    if not j:
+        return "job no longer exists"
+    opts = [("run", "Run now"),
+            ("toggle", "Pause" if j["enabled"] else "Resume"),
+            ("log", "View last log" if j.get("last_log") else "View last log (no runs yet)"),
+            ("prompt", "Edit task…"),
+            ("when", "Change schedule…"),
+            ("dir", "Change working directory…"),
+            ("yes", f"Auto-approve risky actions: {'on → turn off' if j.get('yes') else 'off → turn on'}"),
+            ("delete", "Delete…"),
+            ("cancel", "Back")]
+    title = f"{j['name']} · {j['desc']} · {SCH.state_text(j)}"
+    act = choose(app, title, opts)
+    try:
+        if act in (None, "cancel"):
+            return ""
+        if act == "run":
+            SCH.request_run(jid)
+            return f"'{j['name']}' queued to run now; the result shows in the REPL when it finishes"
+        if act == "toggle":
+            jj = SCH.set_enabled(jid, not j["enabled"])
+            return f"'{jj['name']}' " + ("resumed · " + SCH.state_text(jj) if jj["enabled"] else "paused")
+        if act == "log":
+            return _view_log(j["last_log"]) if j.get("last_log") else "no runs yet"
+        if act == "prompt":
+            t = _ask(app, "Task", default=j["prompt"])
+            if t:
+                SCH.update(jid, prompt=t)
+                return "task updated"
+            return "unchanged"
+        if act == "when":
+            preview, when_v = _when_tools()
+            w = _ask(app, "When?", default=j["when"], validator=when_v, toolbar=preview)
+            if w:
+                jj = SCH.reschedule(jid, w)
+                return f"'{jj['name']}' · {jj['desc']} · next {SCH.fmt_time(jj['next_run'])}"
+            return "unchanged"
+        if act == "dir":
+            from prompt_toolkit.validation import Validator
+            isdir = Validator.from_callable(lambda t: os.path.isdir(os.path.expanduser(t.strip())),
+                                            error_message="no such directory")
+            d = _ask(app, "Working directory", default=j["workdir"], validator=isdir)
+            SCH.update(jid, workdir=os.path.abspath(os.path.expanduser(d)))
+            return "working directory updated"
+        if act == "yes":
+            SCH.update(jid, yes=not j.get("yes"))
+            return f"auto-approve {'off' if j.get('yes') else 'on'} for '{j['name']}'"
+        if act == "delete":
+            if choose(app, f"Delete '{j['name']}'?", [("no", "Keep it"), ("yes", f"Delete '{j['name']}' and its logs")]) == "yes":
+                SCH.remove(jid)
+                return f"deleted '{j['name']}'"
+            return "kept"
+    except (EOFError, KeyboardInterrupt):
+        return "cancelled"
+    except ValueError as e:
+        return str(e)
+    return ""

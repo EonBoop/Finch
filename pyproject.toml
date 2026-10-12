@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = ["rich>=13", "prompt_toolkit>=3.0", "requests", "beautifulsoup4"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "pexpect", "pyte"]
 
 [project.scripts]
 finch = "finch.cli:main"

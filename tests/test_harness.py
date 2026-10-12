@@ -483,3 +483,217 @@ def test_soul_injected_in_task_and_chat(tmp_path):
     a.s.soul = ""
     a.run_turn("write o.txt containing x")
     assert "# Soul" not in llm.calls[-1][0]["content"]
+
+
+# ---------------- scheduler ----------------
+import datetime as _dt
+import subprocess as _sp
+import sys as _sys
+import time as _time
+
+from finch import scheduler as SCH
+
+MON_1300 = _time.mktime(_dt.datetime(2026, 10, 12, 13, 0).timetuple())     # Monday
+
+
+def _at(ts):
+    return _dt.datetime.fromtimestamp(ts).strftime("%a %Y-%m-%d %H:%M")
+
+
+@pytest.mark.parametrize("phrase,kind,first", [
+    ("in 10m", "once", "Mon 2026-10-12 13:10"),
+    ("in 1h30m", "once", "Mon 2026-10-12 14:30"),
+    ("in half an hour", "once", "Mon 2026-10-12 13:30"),
+    ("at 17:30", "once", "Mon 2026-10-12 17:30"),
+    ("9am", "once", "Tue 2026-10-13 09:00"),                 # already passed today -> tomorrow
+    ("tomorrow", "once", "Tue 2026-10-13 09:00"),
+    ("friday at 08:15", "once", "Fri 2026-10-16 08:15"),
+    ("monday 9am", "once", "Mon 2026-10-19 09:00"),          # today's 9am passed -> next week
+    ("oct 20 at 9am", "once", "Tue 2026-10-20 09:00"),
+    ("2026-10-20 09:00", "once", "Tue 2026-10-20 09:00"),
+    ("every 30m", "interval", "Mon 2026-10-12 13:30"),
+    ("hourly", "cron", "Mon 2026-10-12 14:00"),
+    ("daily at 9am", "cron", "Tue 2026-10-13 09:00"),
+    ("every day at 18:00", "cron", "Mon 2026-10-12 18:00"),
+    ("weekdays at 8:30", "cron", "Tue 2026-10-13 08:30"),
+    ("weekends at 10am", "cron", "Sat 2026-10-17 10:00"),
+    ("every mon, wed and fri at 7pm", "cron", "Mon 2026-10-12 19:00"),
+    ("weekly on friday at 5pm", "cron", "Fri 2026-10-16 17:00"),
+    ("monthly on the 1st at 9am", "cron", "Sun 2026-11-01 09:00"),
+    ("cron 0 9 * * 1-5", "cron", "Tue 2026-10-13 09:00"),
+    ("*/15 9-17 * * mon-fri", "cron", "Mon 2026-10-12 13:15"),
+])
+def test_parse_when(phrase, kind, first):
+    sp = SCH.parse_when(phrase, MON_1300)
+    assert sp["kind"] == kind
+    assert _at(SCH.first_run(sp, MON_1300)) == first
+
+
+@pytest.mark.parametrize("bad", ["banana", "yesterday", "every 10s", "cron 1 2 3", "at 25:00",
+                                 "2026-01-01 10:00", "cron 99 * * * *", ""])
+def test_parse_when_rejects(bad):
+    with pytest.raises(ValueError):
+        SCH.parse_when(bad, MON_1300)
+
+
+def test_cron_semantics():
+    t = _dt.datetime(2026, 10, 12, 13, 0)
+    # restricted day-of-month AND day-of-week match if EITHER matches (like cron)
+    nxt = SCH.Cron("0 9 13 * 5").next_after(t)
+    assert nxt == _dt.datetime(2026, 10, 13, 9, 0)
+    assert SCH.Cron("0 0 29 2 *").next_after(t) == _dt.datetime(2028, 2, 29, 0, 0)       # leap day
+    assert SCH.Cron("30 23 31 dec *").next_after(t) == _dt.datetime(2026, 12, 31, 23, 30)
+    assert SCH.Cron("0 12 * * 7").next_after(t).weekday() == 6                            # 7 = Sunday
+    assert SCH.Cron("5/20 * * * *").minutes == [5, 25, 45]
+    assert SCH.Cron("0 9 * * *").next_after(_dt.datetime(2026, 12, 31, 10, 0)) == _dt.datetime(2027, 1, 1, 9, 0)
+
+
+def test_split_when():
+    assert SCH.split_when("every day at 9am check the weather", MON_1300) == ("every day at 9am", "check the weather")
+    assert SCH.split_when("in 10m remind me to stretch", MON_1300) == ("in 10m", "remind me to stretch")
+    assert SCH.split_when("tomorrow -- at noon do it", MON_1300) == ("tomorrow", "at noon do it")
+    assert SCH.split_when("'every weekday at 8' do x", MON_1300) == ("every weekday at 8", "do x")
+    with pytest.raises(ValueError):
+        SCH.split_when("write a haiku", MON_1300)
+
+
+def test_job_store_lifecycle(tmp_path):
+    j = SCH.add_job("every 30m", "check the build", str(tmp_path), now=MON_1300)
+    assert j["name"] == "check-build" and j["next_run"] == MON_1300 + 1800
+    j2 = SCH.add_job("in 10m", "check the build", str(tmp_path), now=MON_1300)
+    assert j2["name"] == "check-build-2"
+    assert SCH.find("1")["id"] == j["id"] and SCH.find(j2["id"][:4])["id"] == j2["id"]
+    assert SCH.find("check-build-2")["id"] == j2["id"]
+    assert not SCH.set_enabled(j["id"], False)["enabled"]
+    assert SCH.state_text(SCH.find(j["id"])) == "paused"
+    later = MON_1300 + 7200
+    jj = SCH.set_enabled(j["id"], True, now=later)              # resume recomputes from now
+    assert jj["enabled"] and jj["next_run"] == later + 1800
+    jj = SCH.reschedule(j["id"], "daily at 9am", now=MON_1300)
+    assert jj["kind"] == "cron" and "every" not in jj and _at(jj["next_run"]) == "Tue 2026-10-13 09:00"
+    SCH.remove(j2["id"])
+    assert len(SCH.load_jobs()) == 1
+    with pytest.raises(ValueError):
+        SCH.add_job("in 10m", "x", str(tmp_path / "nope"))
+    with pytest.raises(ValueError):
+        SCH.add_job("in 10m", "   ", str(tmp_path))
+
+
+class _FakeProc:
+    def __init__(self, pid=None):
+        self.pid = pid or os.getpid()
+
+    def poll(self):
+        return None
+
+    def wait(self):
+        return 0
+
+
+@pytest.fixture
+def no_children(monkeypatch):
+    monkeypatch.setattr(SCH, "_CHILDREN", [])
+
+
+def test_tick_claims_one_job_at_a_time(tmp_path, no_children):
+    a = SCH.add_job("every 30m", "job a", str(tmp_path), now=MON_1300)
+    b = SCH.add_job("in 10m", "job b", str(tmp_path), now=MON_1300)
+    started = []
+    launch = lambda j: (started.append(j["id"]), _FakeProc())[1]
+    assert SCH.tick(now=MON_1300 + 60, launcher=launch) is None            # nothing due yet
+    t = MON_1300 + 3600
+    first = SCH.tick(now=t, launcher=launch)
+    assert first["id"] == b["id"]                                         # earliest due first
+    assert SCH.tick(now=t, launcher=launch) is None                       # one at a time
+    jb = SCH.find(b["id"])
+    assert jb["next_run"] is None and jb["running"]["pid"] == os.getpid() and jb["last_status"] == "running"
+    # finish b, then a runs and its interval is re-anchored to now (no backfill)
+    SCH.update(b["id"], running=None, last_status="ok", last_finished=t)
+    assert SCH.tick(now=t, launcher=launch)["id"] == a["id"]
+    assert SCH.find(a["id"])["next_run"] == t + 1800
+    assert started == [b["id"], a["id"]]
+
+
+def test_tick_reaps_dead_runner_and_marks_missed(tmp_path, no_children):
+    p = _sp.Popen(["true"])
+    p.wait()
+    a = SCH.add_job("every 30m", "a", str(tmp_path), now=MON_1300)
+    SCH.update(a["id"], running={"pid": p.pid, "since": MON_1300, "log": "x"}, next_run=MON_1300 + 9 * 86400)
+    once = SCH.add_job("in 10m", "b", str(tmp_path), now=MON_1300)
+    SCH.update(once["id"], enabled=False)          # paused one-offs are not marked missed
+    late = SCH.add_job("in 10m", "c", str(tmp_path), now=MON_1300)
+    assert SCH.tick(now=MON_1300 + 2 * 86400, launcher=lambda j: _FakeProc()) is None
+    assert SCH.find(a["id"])["last_status"] == "interrupted" and SCH.find(a["id"])["running"] is None
+    assert SCH.find(late["id"])["last_status"] == "missed" and SCH.find(late["id"])["next_run"] is None
+    assert SCH.find(once["id"])["last_status"] is None
+    # a recurring job that was missed for days catches up once, then continues from now
+    SCH.update(a["id"], next_run=MON_1300)
+    t = MON_1300 + 3 * 86400
+    assert SCH.tick(now=t, launcher=lambda j: _FakeProc())["id"] == a["id"]
+    assert SCH.find(a["id"])["next_run"] == t + 1800
+
+
+def test_tick_defers_for_interactive_task_and_run_now(tmp_path, no_children):
+    a = SCH.add_job("every 30m", "a", str(tmp_path), now=MON_1300)
+    with SCH.busy():
+        assert SCH.someone_busy()
+        assert SCH.tick(now=MON_1300 + 1900, launcher=lambda j: _FakeProc()) is None           # waits
+        got = SCH.tick(now=MON_1300 + 1800 + SCH.BUSY_DEFER_MAX + 1, launcher=lambda j: _FakeProc())
+        assert got["id"] == a["id"]                                                              # not forever
+    assert not SCH.someone_busy()
+    b = SCH.add_job("tomorrow 9am", "b", str(tmp_path), now=MON_1300)
+    SCH.update(a["id"], running=None)
+    SCH.request_run(b["id"])
+    got = SCH.tick(now=MON_1300 + 60, launcher=lambda j: _FakeProc())
+    assert got["id"] == b["id"]
+    jb = SCH.find(b["id"])
+    assert not jb["run_now"] and _at(jb["next_run"]) == "Tue 2026-10-13 09:00"    # run-now keeps the schedule
+
+
+def _exec_job(tmp_path, monkeypatch, code, **kw):
+    j = SCH.add_job("in 10m", "say hi", str(tmp_path), **kw)
+    SCH.request_run(j["id"])
+    monkeypatch.setattr(SCH, "job_command", lambda job: [_sys.executable, "-c", code])
+    SCH.tick(launcher=lambda job: _FakeProc())
+    rc = SCH.execute(j["id"])
+    return rc, SCH.find(j["id"])
+
+
+def test_execute_ok_writes_log_and_summary(tmp_path, monkeypatch, no_children):
+    rc, j = _exec_job(tmp_path, monkeypatch, "import os; print('hello from', os.environ['FINCH_SCHEDULED_JOB'])")
+    assert rc == 0 and j["last_status"] == "ok" and j["runs"] == 1 and j["running"] is None
+    assert f"hello from {j['id']}" in j["last_summary"]
+    log = open(j["last_log"]).read()
+    assert "# prompt:   say hi" in log and "· ok · exit 0" in log
+    assert j["next_run"]                           # run-now of a future one-off keeps its slot
+
+
+def test_execute_failure_and_timeout(tmp_path, monkeypatch, no_children):
+    rc, j = _exec_job(tmp_path, monkeypatch, "import sys; print('boom'); sys.exit(3)")
+    assert rc == 1 and j["last_status"] == "failed" and j["last_exit"] == 3
+    SCH.remove(j["id"])
+    rc, j = _exec_job(tmp_path, monkeypatch, "import time; time.sleep(30)", timeout=1)
+    assert j["last_status"] == "timeout"
+
+
+def test_job_command_flags(tmp_path):
+    j = SCH.add_job("in 10m", "do it", str(tmp_path), model="gemma4:12b", soul="", yes=True, timebox=20)
+    cmd = SCH.job_command(j)
+    assert cmd[1:6] == ["-I", "-m", "finch", "-p", "do it"]      # -I: a ./finch folder in the workdir can't shadow us
+    assert ["-m", "gemma4:12b"] == cmd[cmd.index("-m", 3):cmd.index("-m", 3) + 2]
+    assert "--soul" in cmd and cmd[cmd.index("--soul") + 1] == "none"
+    assert cmd[cmd.index("--timebox") + 1] == "20m" and cmd[-1] == "-y"
+
+
+def test_schedule_cli_dispatch(tmp_path, capsys):
+    from finch import cli
+    with pytest.raises(SystemExit) as e:
+        cli.main(["schedule", "add", "every weekday at 8:30", "summarise new commits", "-C", str(tmp_path)])
+    assert e.value.code == 0
+    assert "weekdays at 08:30" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["schedule", "list"])
+    assert "summarise-new-commits" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["schedule", "test", "banana"])
+    assert e.value.code == 2
