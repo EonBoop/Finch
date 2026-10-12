@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finch-agent"
+version = "0.1.0"
+description = "A terminal agent harness for small local models (Mingbird's tricks, Claude Code's look)"
+requires-python = ">=3.10"
+dependencies = ["rich>=13", "prompt_toolkit>=3.0", "requests", "beautifulsoup4"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+finch = "finch.cli:main"
+
+[tool.setuptools]
+packages = ["finch"]
+
+[tool.setuptools.package-data]
+finch = ["skills/*.md", "builtin_souls/*.md"]
