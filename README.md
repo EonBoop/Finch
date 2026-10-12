@@ -1,6 +1,7 @@
 # 🐦 Finch
 
-*Vibe coded terminal agent built for local models using tricks pioneered by Mingbird (https://github.com/Mingbird/Mingbird-agent).*
+*Vibe coded terminal agent built for local models using tricks pioneered by Mingbird (https://github.com/Mingbird/Mingbird-agent).
+No I will not be maintaining this, and frankly I got claude to make this mostly to take advantage of someone elses genuine work. Do with it as thee will, and I hope it makes your life a little easier.*
 
 A terminal agent harness for **small local models**. It carries over the harness-level tricks from
 [Mingbird](https://github.com/Mingbird/Mingbird-agent) and puts them in a terminal UI modelled on Claude Code:
