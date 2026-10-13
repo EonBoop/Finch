@@ -153,11 +153,16 @@ class Agent:
             base = f"# Soul ({self.s.soul})\n{soul}\n\n# Instructions{rider}\n{base}"
         return base
 
+    def _tool_def(self, name):
+        if name == "read_file" and self.s.on("office_extract"):
+            return T.READ_FILE_OFFICE
+        return T.ALL_BUILTIN[name]
+
     def tool_surface(self, qa, cats, extra, disabled):
         """Flat prefill: only the categories this task needs, plus anything enabled."""
         offline = self.s.offline
         if qa:
-            return [T.ALL_BUILTIN[n] for n in READ_ONLY_CHAT_TOOLS
+            return [self._tool_def(n) for n in READ_ONLY_CHAT_TOOLS
                     if not (offline and n in T.ONLINE_TOOLS)]
         if not self.s.on("flat_prefill"):
             names = set(T.ALL_BUILTIN)
@@ -172,7 +177,7 @@ class Agent:
         if "mcp_call" in names and not (self.mcp and self.mcp.config()):
             names.discard("mcp_call")
         order = [t["function"]["name"] for t in T.CORE_TOOLS + T.ADVANCED_TOOLS]
-        defs = [T.ALL_BUILTIN[n] for n in order if n in names]
+        defs = [self._tool_def(n) for n in order if n in names]
         if self.mcp and self.mcp.config():
             try:
                 defs += [d for d in self.mcp.tool_defs(self._turn_task, extra)
@@ -310,7 +315,7 @@ class Agent:
                   empty_total=0, len_trunc=False, repeat=0, tool_streak=0, streak_warns=0,
                   same_sig=0, research_streak=0, research_warns=0, todo_streak=0, todo_stale=0,
                   todo_nudges=0, redirect_warns=0, gates_passed=False, last_pt=0, bash_teach=0, compact_lvl=0, restarts=0,
-                  productive=False)
+                  productive=False, partial_warns=0, loops=0, loop_clean=0, boost=0, boost_think=False)
         fail_count, disabled_recall = {}, {}
         last_sig = last_sig_now = last_tool = None
         last_text = ""
@@ -377,13 +382,52 @@ class Agent:
                 ui.notice(f"attached {len(tb.pending_images)} image(s) to the request", "info")
                 tb.pending_images = []
             ui.model_start(i)
+            on_tok, on_th, kw = ui.token, ui.think, {}
+            if on("stream_loop_guard"):
+                wt, wk = H.RepeatWatch("text"), H.RepeatWatch("reasoning")
+                on_tok = lambda t, f=ui.token: (f(t), wt.feed(t))
+                on_th = lambda t, f=ui.think: (f(t), wk.feed(t))
+                if st["boost"] > 0:
+                    st["boost"] -= 1
+                    kw["overrides"] = {"temperature": 0.9, "repeat_penalty": 1.15}
+                    if st["boost_think"]:
+                        kw["overrides"]["think"] = False
             try:
-                r = self.llm.chat(sess.model, msgs, tools=ct, stream=True, on_token=ui.token,
-                                  on_think=ui.think, cancel=self.cancel)
+                r = self.llm.chat(sess.model, msgs, tools=ct, stream=True, on_token=on_tok,
+                                  on_think=on_th, cancel=self.cancel, **kw)
                 st["fails"] = 0
+                st["loop_clean"] += 1
+                if st["loop_clean"] >= 3:
+                    st["loops"] = 0
             except (KeyboardInterrupt, Cancelled):
                 ui.model_end({"content": ""}, {"interrupted": True})
                 raise
+            except H.Looping as e:
+                # the model is stuck repeating itself mid-stream: drop the partial output (keeping it
+                # would teach the loop), then escalate nudge → hotter sampling / no thinking → reset → stop
+                ui.model_end({"content": ""}, {"interrupted": True})
+                st["loops"] += 1
+                st["loop_clean"] = 0
+                n = st["loops"]
+                if n >= 4:
+                    ui.notice("still looping after a context reset: stopping. Session saved.", "error")
+                    return None
+                if n == 3:
+                    snapshot_reset(f"You were stuck repeating yourself in your {e.where}.")
+                    st["last_pt"], st["compact_lvl"] = 0, 0
+                    ui.notice(f"{e.where} loop (3rd) → context hard reset", "error")
+                    continue
+                st["boost"] = 2
+                st["boost_think"] = e.where == "reasoning"
+                ui.notice(f"{e.where} loop detected → cut off, retrying ({n}/2)", "warn")
+                how = ("Do not reason about it any further." if e.where == "reasoning"
+                       else "Do not restate it.")
+                msgs.append({"role": "user", "content": (
+                    f"⚠️ You got stuck repeating yourself in your {e.where} (\"{e.snippet[:80]}…\") and "
+                    f"were cut off. {how} Pick the single next concrete action and take it now: call a "
+                    "tool, or call finish with a short answer." + (" If an approach keeps failing, "
+                    "try a different one." if n > 1 else ""))})
+                continue
             except LLMError as e:
                 ui.model_end({"content": ""}, {"error": str(e)})
                 low = (str(e) + " " + (e.body or "")).lower()
@@ -670,6 +714,9 @@ class Agent:
                         return None
                     msgs.pop()
                     continue
+                if self._partial_read_nudge(st, pnote):
+                    msgs.extend({"role": "user", "content": n} for n in pending)
+                    continue
                 ui.final(None)
                 return content
             if H.semantically_empty(content):
@@ -715,6 +762,9 @@ class Agent:
                 msgs.append({"role": "user", "content": CONTINUE})
                 continue
             last_text, st["repeat"] = content, 0
+            if self._partial_read_nudge(st, pnote):
+                msgs.extend({"role": "user", "content": n} for n in pending)
+                continue
             if st["gates_passed"]:
                 # every finish gate already passed and the self-check was shown: a prose
                 # reply here IS the delivery (models often answer the self-check in text)
@@ -753,10 +803,28 @@ class Agent:
             note = " Nothing to enable: the tools you asked for are already available. Call them directly."
         return f"[enabled tools: {', '.join(added) or '(none)'}]{note}"
 
+    def _partial_read_nudge(self, st, pnote):
+        """True (and a nudge queued) when a file was only read in part and the model is about to answer."""
+        if not self.s.on("partial_read_gate") or st["partial_warns"] >= 2:
+            return False
+        parts = self.tb.unread_parts()
+        if not parts:
+            return False
+        st["partial_warns"] += 1
+        pnote("⚠️ Not done: you only saw part of these files, so an answer about them would be a guess:\n"
+              + "\n".join(f"- {p}: {u} of {n} lines never shown to you (continue at line {g})"
+                          for p, n, u, g in parts[:5])
+              + "\nRead the rest with read_file(path, start_line=.., end_line=..), or process the whole file "
+              "with one run_bash python script. Base your answer only on what you actually saw. If the file "
+              "is binary (xlsx/docx/pdf/zip), reading it as text is useless: parse it with a script instead.")
+        return True
+
     def _finish_gates(self, qa, content, args, res, st, pnote):
         """Returns 'accept' or 'reject'. Each gate has a hard cap so it can never deadlock."""
         tb = self.tb
         on = self.s.on
+        if self._partial_read_nudge(st, pnote):
+            return "reject"
         if qa:
             return "accept"
         summary = str(args.get("summary", ""))

@@ -122,6 +122,47 @@ def similar(a, b, thresh=0.75):
     return SequenceMatcher(None, a[:200], b[:200]).ratio() > thresh
 
 
+class Looping(Exception):
+    """Raised from a streaming callback when the model is stuck repeating a passage."""
+    def __init__(self, where, snippet, content=""):
+        super().__init__(f"{where} loop")
+        self.where, self.snippet, self.content = where, snippet, content
+
+
+def find_repeat(text, min_unit=16, window=1500):
+    """The repeated passage if the tail of `text` is one unit repeated back to back, else ''.
+    Short units need more repetitions; units of one or two characters (rules, tables) never count."""
+    tail = text[-window:]
+    n = len(tail)
+    for u in range(min_unit, n // 3 + 1):
+        reps = 3 if u >= 40 else 5
+        if u * reps > n:
+            continue
+        unit = tail[-u:]
+        if len(set(unit)) < 6:
+            continue
+        if all(tail[n - (k + 1) * u:n - k * u] == unit for k in range(1, reps)):
+            return unit.strip()
+    return ""
+
+
+class RepeatWatch:
+    """Feed it streamed text; raises Looping once the stream turns into a repeat of itself."""
+    def __init__(self, where, every=80):
+        self.where, self.every = where, every
+        self.buf, self.since = "", 0
+
+    def feed(self, chunk):
+        self.buf = (self.buf + chunk)[-3000:]
+        self.since += len(chunk)
+        if self.since < self.every:
+            return
+        self.since = 0
+        unit = find_repeat(self.buf)
+        if unit:
+            raise Looping(self.where, unit[:120], self.buf)
+
+
 # ---------------- text tool-call salvage (format leaks) ----------------
 _FUNC_CALL_RE = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_.]*)\s*\((.*)\)$', re.S)
 _FUNC_ARG_RE = re.compile(

@@ -697,3 +697,255 @@ def test_schedule_cli_dispatch(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["schedule", "test", "banana"])
     assert e.value.code == 2
+
+
+# ---------------- stream-loop guard ----------------
+def test_find_repeat():
+    loop = "Wait, I should double check the path again. " * 4
+    assert H.find_repeat("Let me think about this problem. " + loop).startswith("Wait, I should")
+    assert H.find_repeat("-" * 400) == ""                      # rules / padding are not loops
+    assert H.find_repeat("def f(): pass\n" * 3) == ""          # short unit, too few reps
+    assert H.find_repeat("A normal answer. It has several different sentences, none of them repeated.") == ""
+
+
+def test_repeat_watch_raises_while_streaming():
+    w = H.RepeatWatch("reasoning")
+    try:
+        for _ in range(60):
+            w.feed("Hmm, let me reconsider the whole approach once more. ")
+        assert False, "no Looping raised"
+    except H.Looping as e:
+        assert e.where == "reasoning" and "reconsider" in e.snippet
+
+
+class LoopyLLM(FakeLLM):
+    """Steps starting with 'LOOP:' stream a degenerate loop through the callbacks."""
+    def chat(self, model, messages, tools=None, stream=True, on_token=None, on_think=None,
+             num_ctx=None, cancel=None, overrides=None):
+        self.overrides = getattr(self, "overrides", []) + [overrides]
+        if self.script and isinstance(self.script[0], str) and self.script[0].startswith("LOOP:"):
+            kind = self.script.pop(0)[5:]
+            self.calls.append([dict(m) for m in messages])
+            cb = on_think if kind == "think" else on_token
+            for _ in range(80):
+                cb("I need to verify the file exists before I continue. ")
+        return super().chat(model, messages, tools, stream, on_token, on_think, num_ctx, cancel)
+
+
+def loopy_agent(tmp_path, script):
+    a, _ = make_agent(tmp_path, [])
+    a.llm = LoopyLLM(script)
+    return a, a.llm
+
+
+def test_stream_loop_guard_nudges_and_boosts(tmp_path):
+    a, llm = loopy_agent(tmp_path, ["LOOP:think", ("create_file", {"path": "o.txt", "content": "x"}),
+                                    ("finish", {"summary": "done"})])
+    a.run_turn("write o.txt with an x in it")
+    assert (tmp_path / "o.txt").exists()
+    assert "stuck repeating yourself in your reasoning" in llm.calls[1][-1]["content"]
+    assert llm.overrides[0] is None
+    assert llm.overrides[1]["think"] is False and llm.overrides[1]["repeat_penalty"] > 1
+
+
+def test_stream_loop_guard_hard_reset_then_stop(tmp_path):
+    a, llm = loopy_agent(tmp_path, ["LOOP:text"] * 6)
+    a.run_turn("write o.txt with an x in it")
+    assert len(llm.calls) == 4                                    # 3 loops + reset, 4th loop stops
+    assert "context was reset" in llm.calls[3][-1]["content"]
+
+
+def test_stream_loop_guard_off(tmp_path):
+    a, llm = loopy_agent(tmp_path, ["LOOP:text", ("create_file", {"path": "o.txt", "content": "x"}),
+                                    ("finish", {"summary": "done"})])
+    a.s.set_trick("stream_loop_guard", False)
+    a.run_turn("write o.txt with an x in it")
+    assert all("repeating yourself" not in str(m.get("content")) for c in llm.calls for m in c)
+
+
+def test_first_byte_timeout_becomes_llm_error(monkeypatch):
+    from finch import llm
+    def boom(*a, **k):
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(llm, "_post", boom)
+    for b in (llm.OllamaBackend(settings()), llm.OpenAIBackend(settings())):
+        with pytest.raises(llm.LLMError, match="no response"):
+            b.chat("m", [{"role": "user", "content": "hi"}])
+
+
+# ---------------- partial-read gate ----------------
+def test_unread_parts_tracking(tmp_path):
+    tb = box(tmp_path)
+    (tmp_path / "big.txt").write_text("".join(f"row {i} " + "x" * 40 + "\n" for i in range(400)))
+    (tmp_path / "small.txt").write_text("a\nb\n")
+    tb.run("read_file", {"path": "small.txt"})
+    assert tb.unread_parts() == []
+    tb.run("read_file", {"path": "big.txt"})
+    (name, total, unseen, nxt), = tb.unread_parts()
+    assert name == "big.txt" and total == 400 and unseen > 0 and nxt > 1
+    for _ in range(10):                      # each ranged read is capped too: keep following "continue at line N"
+        parts = tb.unread_parts()
+        if not parts:
+            break
+        tb.run("read_file", {"path": "big.txt", "start_line": parts[0][3], "end_line": 400})
+    assert tb.unread_parts() == []
+
+
+def test_script_over_file_counts_as_full_read(tmp_path):
+    tb = box(tmp_path)
+    (tmp_path / "big.txt").write_text("y" * 50 + "\n" + ("row\n" * 3000))
+    tb.run("read_file", {"path": "big.txt"})
+    assert tb.unread_parts()
+    tb.run("run_bash", {"command": "wc -l big.txt"})
+    assert tb.unread_parts() == []
+
+
+def test_partial_read_gate_rejects_answer_then_allows(tmp_path):
+    (tmp_path / "data.txt").write_text("".join(f"row {i} " + "x" * 40 + "\n" for i in range(400)))
+    a, llm = make_agent(tmp_path, [("read_file", {"path": "data.txt"}),
+                                   ("finish", {"summary": "The file lists 400 rows of x."})])
+    a.run_turn("summarize data.txt and write the summary to s.md")
+    nudges = [m["content"] for c in llm.calls for m in c if "never shown to you" in str(m.get("content"))]
+    assert nudges and "data.txt" in nudges[0]
+
+
+def test_partial_read_gate_off(tmp_path):
+    (tmp_path / "data.txt").write_text("".join(f"row {i} " + "x" * 40 + "\n" for i in range(400)))
+    a, llm = make_agent(tmp_path, [("read_file", {"path": "data.txt"}),
+                                   ("finish", {"summary": "The file lists 400 rows of x."})])
+    a.s.set_trick("partial_read_gate", False)
+    a.run_turn("summarize data.txt and write the summary to s.md")
+    assert not any("never shown to you" in str(m.get("content")) for c in llm.calls for m in c)
+
+
+def test_partial_read_gate_on_prose_answer_in_task_mode(tmp_path):
+    (tmp_path / "data.txt").write_text("".join(f"row {i} " + "x" * 40 + "\n" for i in range(400)))
+    a, llm = make_agent(tmp_path, [("read_file", {"path": "data.txt"}),
+                                   "The file lists 400 rows of x.", ("finish", {"summary": "done"})])
+    a.run_turn("summarize data.txt and write the summary to s.md")
+    nudges = [m["content"] for c in llm.calls for m in c if "never shown to you" in str(m.get("content"))]
+    assert nudges
+
+
+def test_run_python_over_file_counts_as_full_read(tmp_path):
+    tb = box(tmp_path)
+    (tmp_path / "big.txt").write_text("y" * 50 + "\n" + ("row\n" * 3000))
+    tb.run("read_file", {"path": "big.txt"})
+    assert tb.unread_parts()
+    tb.run("run_python", {"code": "print(len(open('big.txt').read().splitlines()))"})
+    assert tb.unread_parts() == []
+
+
+def test_timeout_on_think_retry_becomes_llm_error(monkeypatch):
+    import io, urllib.error
+    from finch import llm
+    calls = []
+    def post(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b"does not support thinking"))
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(llm, "_post", post)
+    s = settings(); s.think = True
+    with pytest.raises(llm.LLMError, match="no response"):
+        llm.OllamaBackend(s).chat("m", [{"role": "user", "content": "hi"}])
+    assert len(calls) == 2
+
+
+# ---------------- office extraction ----------------
+import zipfile as _zf
+
+_NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+
+
+def make_xlsx(path):
+    with _zf.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {_NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                   '<sheets><sheet name="Jobs" sheetId="1" r:id="rId1"/><sheet name="Empty" sheetId="2" r:id="rId2"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>')
+        z.writestr("xl/sharedStrings.xml", f'<sst {_NS}><si><t>Company</t></si><si><t>Applied</t></si>'
+                   '<si><r><t>Acme </t></r><r><t>Corp</t></r></si><si><t>Date</t></si></sst>')
+        z.writestr("xl/styles.xml", f'<styleSheet {_NS}><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>')
+        z.writestr("xl/worksheets/sheet1.xml", f'<worksheet {_NS}><sheetData>'
+                   '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>3</v></c><c r="D1" t="inlineStr"><is><t>Note</t></is></c></row>'
+                   '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" s="1"><v>45292</v></c><c r="C2"><v>3.0</v></c><c r="D2" t="b"><v>1</v></c></row>'
+                   '<row r="4"><c r="A4" t="s"><v>1</v></c></row></sheetData></worksheet>')
+        z.writestr("xl/worksheets/sheet2.xml", f'<worksheet {_NS}><sheetData/></worksheet>')
+
+
+def test_read_xlsx_gives_real_rows(tmp_path):
+    make_xlsx(tmp_path / "t.xlsx")
+    out = box(tmp_path).run("read_file", {"path": "t.xlsx"})
+    assert "## Sheet: Jobs (3 non-empty rows" in out
+    assert "1: Company | Date |  | Note" in out
+    assert "2: Acme Corp | 2024-01-01 | 3 | TRUE" in out
+    assert "4: Applied" in out and "## Sheet: Empty" in out and "(empty)" in out
+
+
+def test_read_docx_and_pptx(tmp_path):
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    with _zf.ZipFile(tmp_path / "d.docx", "w") as z:
+        z.writestr("word/document.xml", f'<w:document {W}><w:body>'
+                   '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Plan</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:t>First line</w:t></w:r></w:p>'
+                   '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+                   '</w:body></w:document>')
+    A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    with _zf.ZipFile(tmp_path / "s.pptx", "w") as z:
+        z.writestr("ppt/slides/slide2.xml", f'<p {A}><a:p><a:r><a:t>Second</a:t></a:r></a:p></p>')
+        z.writestr("ppt/slides/slide1.xml", f'<p {A}><a:p><a:r><a:t>First</a:t></a:r></a:p></p>')
+    tb = box(tmp_path)
+    d = tb.run("read_file", {"path": "d.docx"})
+    assert "# Plan" in d and "First line" in d and "| a | b |" in d
+    s = tb.run("read_file", {"path": "s.pptx"})
+    assert s.index("First") < s.index("Second") and "## Slide 2" in s
+
+
+def test_office_errors_are_explained(tmp_path):
+    (tmp_path / "bad.xlsx").write_bytes(b"not a zip at all")
+    (tmp_path / "old.xls").write_bytes(b"\xd0\xcf\x11\xe0")
+    (tmp_path / "x.pdf").write_bytes(b"%PDF-1.4 junk")
+    tb = box(tmp_path)
+    assert "cannot read bad.xlsx" in tb.run("read_file", {"path": "bad.xlsx"})
+    assert "libreoffice" in tb.run("read_file", {"path": "old.xls"})
+    assert "cannot read x.pdf" in tb.run("read_file", {"path": "x.pdf"})
+
+
+def test_big_xlsx_is_truncated_and_gated(tmp_path):
+    # many rows -> read is cut at the cap, so the partial-read gate has something to track
+    rows = "".join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>Company number {i}</t></is></c></row>' for i in range(1, 801))
+    with _zf.ZipFile(tmp_path / "big.xlsx", "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {_NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                   '<sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>')
+        z.writestr("xl/worksheets/sheet1.xml", f'<worksheet {_NS}><sheetData>{rows}</sheetData></worksheet>')
+    tb = box(tmp_path)
+    out = tb.run("read_file", {"path": "big.xlsx"})
+    assert "Company number 1" in out and "[truncated" in out
+    assert tb.unread_parts()
+    tb.run("read_file", {"path": "big.xlsx", "start_line": 700, "end_line": 802})
+    assert "Company number 800" in tb.run("read_file", {"path": "big.xlsx", "start_line": 790, "end_line": 802})
+
+
+def test_office_extract_off(tmp_path):
+    make_xlsx(tmp_path / "t.xlsx")
+    tb = box(tmp_path)
+    tb.s.set_trick("office_extract", False)
+    assert "## Sheet" not in tb.run("read_file", {"path": "t.xlsx"})
+
+
+def test_read_file_advertises_office_support_only_when_on(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    desc = lambda: next(d["function"]["description"] for d in a.tool_surface(False, ["file"], set(), set())
+                        if d["function"]["name"] == "read_file")
+    assert "xlsx" in desc()
+    a.s.set_trick("office_extract", False)
+    assert "xlsx" not in desc()
+
+
+def test_missing_office_library_points_back_to_read_file():
+    out = T.format_bash_out(1, "", "ModuleNotFoundError: No module named 'openpyxl'", False, True)
+    assert "read_file(path)" in out
+    assert "read_file(path)" not in T.format_bash_out(1, "", "ModuleNotFoundError: No module named 'numpy'", False, True)

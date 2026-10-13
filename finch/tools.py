@@ -4,6 +4,7 @@ Schemas are deliberately minimal (no per-parameter descriptions): every byte of 
 static prefill is paid on every turn by a small local model.
 """
 import base64
+import copy
 import glob
 import hashlib
 import json
@@ -15,7 +16,7 @@ import subprocess
 import tempfile
 import time
 
-from . import config
+from . import config, docs
 from .safety import safe_path
 
 
@@ -63,6 +64,10 @@ ADVANCED_TOOLS = [
        ["server", "tool"]),
 ]
 ALL_BUILTIN = {t["function"]["name"]: t for t in CORE_TOOLS + ADVANCED_TOOLS}
+READ_FILE_OFFICE = copy.deepcopy(ALL_BUILTIN["read_file"])     # advertised only while office_extract is on
+READ_FILE_OFFICE["function"]["description"] = (
+    "Read a file's content; also extracts the text of .xlsx/.docx/.pptx/.pdf (spreadsheets as numbered rows, "
+    "no libraries needed). Optional start_line/end_line to read a range")
 ONLINE_TOOLS = {"web_search", "web_fetch", "web_search_multi"}
 MUTATING = ("create_file", "edit_file", "append_file", "delete_file", "run_bash", "run_python")
 PRODUCTIVE = ("create_file", "edit_file", "append_file", "run_bash", "run_python", "finish")
@@ -173,10 +178,17 @@ def auto_repair(path):
         return False
 
 
+_OFFICE_IMPORT = re.compile(r"No module named '(openpyxl|pandas|xlrd|docx|pptx|PyPDF2|pypdf|fitz|pdfplumber)\b")
+
+
 def format_bash_out(rc, out, err, small=False, hints=True):
     res = f"[exit {rc}]\nSTDOUT:\n{out[-5000:]}\nSTDERR:\n{err[-2000:]}"
     if not hints:
         pass
+    elif _OFFICE_IMPORT.search(err):
+        res += ("\n[hint: that library isn't installed and you don't need it: read_file(path) already returns the "
+                "text of .xlsx/.docx/.pptx/.pdf files (spreadsheets as numbered rows). Use it, or process the "
+                "text it gives you.]")
     elif rc == 127 and ("not found" in err or not (out.strip() or err.strip())):
         res += ("\n[hint: exit 127 = command not found on this machine. Python tools that aren't on PATH "
                 "usually work as modules: python3 -m pytest / python3 -m pip. Use python3, not python.]")
@@ -542,6 +554,7 @@ class ToolBox:
         self.workdir = os.path.abspath(workdir)
         self.rollback = Rollback(self.workdir, enabled=lambda: self.s.on("backups"))
         self.crawl = {}
+        self.partial = {}     # real path -> [total lines, [(first, last) line ranges the model has seen]]
 
     def p(self, path):
         return os.path.realpath(os.path.join(self.workdir, os.path.expanduser(str(path))))
@@ -622,9 +635,20 @@ class ToolBox:
             return f"[{path} is a directory; use list_dir]"
         if real.lower().endswith(IMG_EXTS):
             return self._read_image(path, real)
+        ext = os.path.splitext(real)[1].lower()
+        if ext in docs.LEGACY_EXTS and self.s.on("office_extract"):
+            return (f"[{path} is an old binary {ext} file and can't be read as text. Convert it first: "
+                    f"`libreoffice --headless --convert-to {ext + 'x'} {path}` (then read the {ext + 'x'}), "
+                    f"or tell the user.]")
         st = self.crawl.setdefault(real, [0, 0, 0, False])   # reads, chars served, nudges, throttle-note
         st[0] += 1
-        text = read_text(real)
+        if ext in docs.DOC_EXTS and self.s.on("office_extract"):
+            try:
+                text = f"[{ext[1:]} file, text extracted by the harness]\n" + docs.extract(real)
+            except docs.DocError as e:
+                return f"[cannot read {path}: {e}]"
+        else:
+            text = read_text(real)
         lines = text.splitlines()
         sl, el = int(a.get("start_line") or 0), int(a.get("end_line") or 0)
         if sl > 0 or el > 0:
@@ -641,6 +665,13 @@ class ToolBox:
                 meta = (f"\n[truncated: file has {len(lines)} lines / {len(text)} chars; showed about the first "
                         f"{shown} lines. Read more with read_file(start_line={shown}, end_line={shown + 150}).]")
         st[1] += len(body)
+        if sl > 0 or el > 0:
+            first = sl
+        else:
+            first = 1
+        # a cut-off last line was not really seen
+        shown = len(body.splitlines()) - (1 if body and len(body) >= READ_CAP and not body.endswith("\n") else 0)
+        self.partial.setdefault(real, [len(lines), []])[1].append((first, first + shown - 1))
         try:
             budget = min(max(CRAWL_MULT * os.path.getsize(real), CRAWL_FLOOR), CRAWL_CAP)
         except OSError:
@@ -664,6 +695,30 @@ class ToolBox:
             return (f"[note: read #{st[0]} of '{path}'. If you are counting/searching/aggregating, a python "
                     f"script via run_bash is faster; ignore this if you are just re-checking.]\n" + body + meta)
         return body + meta
+
+    def _scripted(self, text):
+        """A script that names a partly-read file is how big files get processed whole."""
+        for real in [r for r in self.partial if os.path.basename(r) in text]:
+            del self.partial[real]
+
+    def unread_parts(self):
+        """[(relative path, total lines, unseen lines, first unseen line)] for files read only in part."""
+        out = []
+        for real, (total, ranges) in self.partial.items():
+            seen, nxt = 0, 1
+            for a, b in sorted(ranges):
+                a = max(a, nxt)
+                if b >= a:
+                    seen += b - a + 1
+                    nxt = b + 1
+            if total > seen and os.path.exists(real):
+                # first unseen line = first gap in the merged ranges
+                gap = 1
+                for a, b in sorted(ranges):
+                    if a <= gap:
+                        gap = max(gap, b + 1)
+                out.append((os.path.relpath(real, self.workdir), total, total - seen, gap))
+        return out
 
     def _read_image(self, path, real):
         size = os.path.getsize(real)
@@ -780,6 +835,7 @@ class ToolBox:
             cmd = re.sub(r"\\\\+n", "\n", cmd)
         cmd = re.sub(r'\\\\+"', '"', cmd)
         snapped = bash_snapshot(cmd, self.workdir, self.rollback) if self.s.on("backups") else []
+        self._scripted(cmd)
         rc, out, err, timed_out = _run_proc(cmd, self.workdir, self.s.bash_timeout)
         if timed_out:
             out = out[:4000] + f"\n[timed out after {self.s.bash_timeout}s; process tree killed]"
@@ -792,6 +848,7 @@ class ToolBox:
 
     def t_run_python(self, a):
         code = str(a.get("code") or a.get("script") or "")
+        self._scripted(code)
         fd, script = tempfile.mkstemp(suffix=".py", prefix="finch_run_", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(code)

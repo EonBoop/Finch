@@ -129,14 +129,21 @@ class OllamaBackend:
             return json.loads(r.read()).get("version", "?")
 
     def chat(self, model, messages, tools=None, stream=True, on_token=None, on_think=None,
-             num_ctx=None, cancel=None):
+             num_ctx=None, cancel=None, overrides=None):
+        ov = overrides or {}
         opts = {"num_ctx": num_ctx or self.s.num_ctx, "num_predict": self.s.num_predict}
         if self.s.temperature is not None:
             opts["temperature"] = self.s.temperature
+        if "temperature" in ov:
+            opts["temperature"] = ov["temperature"]
+        if "repeat_penalty" in ov:
+            opts["repeat_penalty"] = ov["repeat_penalty"]
         payload = {"model": model, "messages": messages, "tools": tools or [],
                    "stream": stream, "options": opts, "keep_alive": self.s.keep_alive}
         if self.s.think is not None:
             payload["think"] = bool(self.s.think)
+        if "think" in ov:
+            payload["think"] = ov["think"]
         url = f"{self.host}/api/chat"
         timeout = self.s.api_timeout if stream else 900
         try:
@@ -149,10 +156,14 @@ class OllamaBackend:
                     resp = _post(url, payload, timeout)
                 except urllib.error.HTTPError as e2:
                     raise _http_error(e2)
+                except OSError as e2:
+                    raise LLMError(f"no response from Ollama within {timeout}s ({e2 or type(e2).__name__})")
             else:
                 raise err
         except urllib.error.URLError as e:
             raise LLMError(f"cannot reach Ollama at {self.host}: {e.reason}")
+        except OSError as e:     # socket timeout while waiting for the first byte (model loading / busy)
+            raise LLMError(f"no response from Ollama within {timeout}s ({e or type(e).__name__})")
         if not stream:
             with resp:
                 d = json.loads(resp.read())
@@ -282,13 +293,18 @@ class OpenAIBackend:
         return out
 
     def chat(self, model, messages, tools=None, stream=True, on_token=None, on_think=None,
-             num_ctx=None, cancel=None):
+             num_ctx=None, cancel=None, overrides=None):
+        ov = overrides or {}
         payload = {"model": model, "messages": self._to_openai(messages), "stream": True,
                    "max_tokens": self.s.num_predict}
         if tools:
             payload["tools"] = tools
         if self.s.temperature is not None:
             payload["temperature"] = self.s.temperature
+        if "temperature" in ov:
+            payload["temperature"] = ov["temperature"]
+        if "repeat_penalty" in ov:
+            payload["frequency_penalty"] = 0.5     # no repeat_penalty in the OpenAI schema
         try:
             resp = _post(f"{self.host.rstrip('/')}/chat/completions", payload,
                          self.s.api_timeout, self._headers())
@@ -296,6 +312,8 @@ class OpenAIBackend:
             raise _http_error(e)
         except urllib.error.URLError as e:
             raise LLMError(f"cannot reach {self.host}: {e.reason}")
+        except OSError as e:
+            raise LLMError(f"no response from {self.host} within {self.s.api_timeout}s ({e or type(e).__name__})")
         splitter = InlineThinkSplitter(on_token, on_think)
         thinks, calls = [], {}
         usage, finish = {}, None

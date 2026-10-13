@@ -38,7 +38,7 @@ Useful flags: `-C dir`, `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `
 | `finch/mcp.py` | Dependency-free stdio MCP client. Tools are exposed flat as `server.tool`, with a manifest cache. |
 | `finch/ui.py` | `TerminalUI` (live spinner, `●`/`⎿` tool lines, diffs, todo checklist, permission panel) and the headless `PlainUI`. |
 | `finch/cli.py` | REPL, slash commands, `@file` mentions, `!shell`, headless mode. |
-| `finch/tricks.py` | Registry of the 32 toggleable tricks (key, group, label, description) and ablation aliases. |
+| `finch/tricks.py` | Registry of the 35 toggleable tricks (key, group, label, description) and ablation aliases. |
 | `finch/themes.py` | 7 colour themes: rich styles + prompt_toolkit styles, swatch helpers. |
 | `finch/settings_menu.py` | `/settings`: inline prompt_toolkit app with General · Tricks · Theme · Soul · Schedule tabs, plus the job wizard and `choose()` picker. |
 | `finch/scheduler.py` | Task scheduler: schedule phrase parser + 5-field cron engine, file-locked job store (`~/.finch/schedule/jobs.json`), runner `tick()`, per-run supervisor (`finch schedule exec`), daemon, `finch schedule …` CLI. |
@@ -46,7 +46,7 @@ Useful flags: `-C dir`, `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `
 | `finch/skills/*.md` | Built-in skills: bug_fix, test_driven, python_project, web_research, data_analysis, code_review. |
 | `scripts/pty_drive.py` | Dev tool: drives the REPL in a pty (pexpect + pyte, answers CPR) and prints the screen. Use it to verify menus/toolbars. |
 | `CLAUDE.md` | Local only (gitignored). Short orientation for Claude: commands, layout, invariants, gotchas, how this user works. |
-| `tests/test_harness.py` | 132 tests, including a scripted `FakeLLM` that drives the full loop. |
+| `tests/test_harness.py` | 152 tests, including a scripted `FakeLLM` that drives the full loop. |
 
 Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `mcp.json`, `skills/`,
 `cache/`, `history` and `schedule/` (jobs.json, logs/, daemon.pid, daemon.log, busy/). Per-workdir state lives in `<workdir>/.finch/`: `backups/`, `trash/` and `sources/` (fetched web pages).
@@ -120,7 +120,7 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
    The UI now uses named styles only (`output`, `rule`, `diff.add`, `bullet`, …). The prompt, toolbar and
    completion menu follow the theme through a prompt_toolkit `DynamicStyle`.
 3. **Settings menu** (`/settings`): General (model, theme, thinking, ctx, output cap, temperature,
-   keep_alive, command timeout, routing, timebox, offline, verbose, force English), Tricks (32 toggles
+   keep_alive, command timeout, routing, timebox, offline, verbose, force English), Tricks (32 toggles; 33 since the stream-loop guard
    in 7 groups, plus enable-all / disable-all) and Theme (swatches, live preview). Saved on close.
    Also `/theme`, `/tricks`, and a `--theme` CLI flag.
 4. Fixes found along the way:
@@ -203,6 +203,61 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
     poem job in order (the one-off waited for the running job).
   - pty walkthrough: `/schedule <when> <task>`, list, Schedule tab, the job actions picker, the wizard with live
     preview and error, and result notices appearing in the REPL while the daemon was also running.
+
+### Follow-up: stream-loop guard
+
+- New trick `stream_loop_guard` (Anti-loop). `repeat_detect` only catches the same reply two turns in a row; this one catches a
+  model that degenerates *inside* one generation, in the answer text or in the reasoning channel, until it burns the token cap.
+- Detection (`heuristics.find_repeat` / `RepeatWatch`): the streamed tail is one unit repeated back to back (≥16 chars; 5 reps
+  for units under 40 chars, 3 above; units with <6 distinct characters, such as `-----`, never count). Checked every 80
+  streamed chars from the `on_token` / `on_think` callbacks, which raise `Looping`; both backends close the response on the way
+  out. Tool-call arguments are not streamed through the callbacks, so a long legit `create_file` is never inspected.
+- Recovery ladder in `Agent._loop` (the partial output is dropped, not added to the context): 1st/2nd hit → user-role nudge that
+  quotes the loop and demands one concrete action, and the next 2 calls run with `overrides` (temperature 0.9, repeat_penalty
+  1.15, and `think: false` if the loop was in the reasoning). 3rd hit → `snapshot_reset`. 4th → stop the turn. The counter clears
+  after 3 clean model turns.
+- `chat()` of both backends takes `overrides` (OpenAI maps repeat_penalty to `frequency_penalty`). Test fakes need the kwarg;
+  the agent only passes it when it is set.
+- Verified: 137 tests (5 new: detector, streaming watch, nudge+boost, reset→stop, trick off); live gemma4:12b task unaffected;
+  `think: false` override confirmed against Ollama. A real degenerate loop was not reproduced live.
+
+### Follow-up: partial-read gate
+
+- New trick `partial_read_gate` (Finish gates). A pasted run showed the model read a file ("194 lines · truncated"), then
+  summarised it with invented generic content. `read_file` already says "[truncated…]", but small models ignore a note
+  inside a tool result.
+- `ToolBox.partial` records which line ranges of each file the model has actually seen (a cut-off last line does not count).
+  `unread_parts()` merges them and returns files with unseen lines plus the first unseen line. A `run_bash` command that
+  names the file removes it from the list (a script is how big files get processed whole).
+- `Agent._partial_read_nudge` runs first in `_finish_gates` (before the Q&A shortcut) and on the Q&A text-answer path.
+  It queues a user-role nudge listing the files, the unseen line counts and where to continue, and suggests a script for
+  binary files (xlsx/docx/pdf are read as text, so they come back as junk). Capped at 2 per turn so it can never deadlock.
+- The extraction itself is the next follow-up (below).
+- Live gemma4:12b on a 68 KB CSV: truncated read → the gate challenged the first prose answer; after the model counted with a
+  script (run_python or `grep -c` via run_bash) it was not nagged again and gave the right count. A first live run used a file
+  under the read cap (nothing truncated, correctly no gate), and a second showed `run_python` was missing from the
+  script exemption (fixed). Separate, pre-existing: after a prose answer gemma keeps replying "I understand…" to the
+  CONTINUE nudge instead of calling finish, until `repeat_detect` ends the turn.
+- Verified: 144 tests at the time (7 new: coverage tracking, bash and run_python scripts count, gate rejects then allows, trick off).
+
+### Follow-up: office / PDF extraction
+
+- New trick `office_extract` (Output repair). `read_file` used to decode xlsx/docx as latin-1 zip bytes, so the model summarised
+  noise (the original pasted failure). `finch/docs.py` now returns text: xlsx/xlsm (shared strings incl. rich text, inline
+  strings, booleans, gaps kept as empty columns, date detection from `cellXfs`/`numFmt`, one `## Sheet:` block each, every line
+  prefixed with its real row number), docx (headings as `#`, tables as `| a | b |`), pptx (slides in numeric order plus notes), pdf
+  (`pypdf` if importable, else the `pdftotext` binary, else an error that says what to install). Stdlib only, no new dependency.
+  Parsed text is cached by mtime so ranged reads don't re-parse. Legacy .xls/.doc/.ppt return a LibreOffice conversion hint.
+- The extracted text flows through the normal `read_file` path, so line ranges, the 6000-char cap, the crawl guard and the
+  partial-read gate all apply unchanged.
+- Discoverability was the real catch: with only the extractor, gemma ignored `read_file` and wrote pandas/openpyxl scripts that
+  failed on missing modules. Two fixes: `read_file`'s description advertises office support only while the trick is on
+  (`Agent._tool_def`), and a `ModuleNotFoundError` for openpyxl/pandas/xlrd/docx/pptx/PyPDF2/pypdf/fitz/pdfplumber appends a hint
+  to use `read_file` (`env_hints`).
+- Bug found by the tests: `ElementTree.clear()` drops attributes, so row numbers were read after clearing and drifted.
+- Verified: 152 tests; extractor on real Excel/Word files (CMSIS spec sheet: 62 rows, multi-column); live gemma4:12b read the
+  xlsx via `read_file` and quoted the correct cells. Not verified: PDF (neither pypdf nor pdftotext is installed here, only the
+  error path is tested), xlsx files with merged/hidden sheets or password protection.
 
 ## 6. Ideas / open items
 

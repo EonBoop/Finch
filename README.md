@@ -96,6 +96,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 | …survive a flaky server | 500s → compact + inject a path-breaking message (same messages on a degraded runner reproduce the same failure); exponential backoff; optional restart hook `FINCH_OLLAMA_RESTART_CMD` after 4 consecutive 500s. `keep_alive=30m` is sent top-level so the model isn't unloaded mid-task. Bash runs in its own process group and the whole tree is killed on timeout. | `agent._loop`, `llm.py` |
 | …be trusted with your disk | **Safety rings**: ① irreversible ops refused outright (`rm -rf /`, `mkfs`, `dd of=/dev/sd*`, `curl … \| sh`, `shutdown`…) · ② uninstalls / env mutation need confirmation, and are denied when unattended; recursive deletes only inside the workdir · ③ out-of-workdir paths and sensitive files (`.ssh`, `.env`, keys…) need confirmation; sensitive writes are always refused · ④ rollback (above). `/unsafe` bypasses ring ② only. | `safety.py` |
 | …manage wall-clock time | Timebox pacing nudges at 50/75/90%. | `heuristics.budget_nudge` |
+| …read office files | `read_file` extracts text from **.xlsx / .xlsm / .docx / .pptx** with the standard library (spreadsheets come back as numbered rows with dates formatted, one `## Sheet:` block per sheet) and from **.pdf** via `pypdf` or `pdftotext` if either is installed (otherwise it says how to get one). Old .xls/.doc/.ppt get a LibreOffice conversion hint. A script that dies on `import openpyxl/pandas/docx…` is told to use `read_file` instead. | `docs.py`, `tools.ToolBox.t_read_file` |
 | …see | `read_file` on an image attaches it to the next request (vision models); `@image.png` in the prompt too. | `tools._read_image` |
 | (engines) | Ollama native (thinking tri-state, top-level `think`/`keep_alive`, 400-retry without `think`) or any OpenAI-compatible server (`"backend": "openai"` in config). Inline `<think>` tags are split out of content, even when torn across stream chunks. | `llm.py` |
 | (small-model protocol) | ≤4B models: edit_file disabled up front, bash output trimmed to the tail, shell-vs-python teaching hint. | `agent.run_turn` |
@@ -174,7 +175,7 @@ status bar shows the next or running job.
 
 ## Toggleable tricks
 
-Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 32 of them in 7 groups) that
+Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 35 of them in 7 groups) that
 can be switched off. Use the Tricks tab in `/settings`, `/tricks <key> off`, `"tricks": {"crawl_guard": false}`
 in config.json, or `FINCH_ABLATION=key1,key2` (Mingbird's ablation names `finish_gate`, `anti_loop` and
 `flat_prefill` are accepted as aliases). "Disable all tricks" gives you a plain agent loop for comparison.
@@ -209,6 +210,6 @@ MCP (`~/.finch/mcp.json`):
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests
 ```
 
-132 tests, no backend needed. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
+152 tests, no backend needed. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
 prints the screen (see its docstring). The suite includes a scripted fake model that drives the full loop through the finish gates, the
 anti-loop ladder, the empty-turn ladder and the chat mode. It doesn't need a running backend.

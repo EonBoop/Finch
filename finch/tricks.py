@@ -26,6 +26,8 @@ TRICKS = [
      "Unescape literal \\n in .py files that fail to compile (kept only if it then compiles)."),
     ("truncation_feedback", "Output repair", "Truncation feedback",
      "When output hits the token cap: 'write a skeleton, then append' instead of a generic nudge."),
+    ("office_extract", "Output repair", "Office / PDF extraction",
+     "read_file turns xlsx, docx, pptx and pdf into text (rows numbered) instead of returning zip bytes."),
     ("env_hints", "Output repair", "Environment hints",
      "Explain exit 127, broken pytest plugins, interactive commands, missing arguments."),
     # ---- anti-loop
@@ -45,6 +47,8 @@ TRICKS = [
      "Empty outputs: nudge at 3, context hard reset at 6 (×3), then stop."),
     ("repeat_detect", "Anti-loop", "Repeated-text detection",
      "Same prose twice in a row → end the turn."),
+    ("stream_loop_guard", "Anti-loop", "Stream-loop guard",
+     "Model repeats itself mid-stream (text or reasoning) → cut it off, nudge, retry hotter / without thinking, hard reset."),
     # ---- finish gates
     ("fake_finish_gate", "Finish gates", "Fake-finish gate",
      "Reject finish when no real work was done."),
@@ -56,6 +60,8 @@ TRICKS = [
      "The plan must be ticked before finishing."),
     ("self_check", "Finish gates", "Delivery self-check",
      "Re-inject the original task once before accepting finish."),
+    ("partial_read_gate", "Finish gates", "Partial-read gate",
+     "Reject an answer built on a file the model only read the start of; make it read the rest or script it."),
     ("plan_nudge", "Finish gates", "Stale-plan nudge",
      "Remind the model to tick the plan after 4 productive steps without an update."),
     ("wrap_up", "Finish gates", "Wrap-up summary",
