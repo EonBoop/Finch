@@ -852,6 +852,28 @@ def test_timeout_on_think_retry_becomes_llm_error(monkeypatch):
     assert len(calls) == 2
 
 
+def test_think_off_is_model_agnostic(monkeypatch):
+    import io, json as _j
+    from finch import llm
+    sent = []
+    def post(url, payload, *a, **k):
+        sent.append((url, payload))
+        if "chat/completions" in url:
+            lines = [b'data: {"choices":[{"delta":{"reasoning_content":"hmm","content":"hi"}}]}\n', b"data: [DONE]\n"]
+        else:
+            lines = [(_j.dumps({"message": {"thinking": "hmm", "content": "<think>x</think>hi"}, "done": True}) + "\n").encode()]
+        return io.BytesIO(b"".join(lines))
+    monkeypatch.setattr(llm, "_post", post)
+    s = settings(); s.think = False
+    seen = []
+    for be, model in ((llm.OllamaBackend(s), "gpt-oss:20b"), (llm.OllamaBackend(s), "qwen3:8b"), (llm.OpenAIBackend(s), "m")):
+        r = be.chat(model, [{"role": "user", "content": "hi"}], on_think=seen.append)
+        assert "thinking" not in r["message"] and r["message"]["content"] == "hi"
+    assert seen == []
+    assert sent[0][1]["think"] == "low" and sent[1][1]["think"] is False
+    assert sent[2][1]["reasoning_effort"] == "none"
+
+
 # ---------------- office extraction ----------------
 import zipfile as _zf
 

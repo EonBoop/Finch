@@ -271,3 +271,10 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
 - Consider `/think off` as the default for gemma4 on simple tasks; thinking spirals cost minutes.
 - Benchmark Finch vs Mingbird on a few LRAB tasks to validate parity.
 - `prompt_eval_count` semantics under Ollama prompt caching should be verified; the ctx% display relies on it.
+
+## Follow-up: thinking off works on any model
+
+- The `think` setting was only reliable on gemma4: the OpenAI-compatible backend ignored it, gpt-oss ignores boolean `think`
+  on Ollama, and models that think regardless of the flag still streamed their reasoning.
+- `llm.py`: Ollama sends `"low"` for off on gpt-oss (`_think_field`); the OpenAI backend sends `reasoning_effort` ("none"/"medium"),
+  retrying once without it on HTTP 400. When think is off, any thinking (channel or inline `<think>`) is dropped from the UI and the message.

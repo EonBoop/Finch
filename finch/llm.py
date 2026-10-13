@@ -27,6 +27,13 @@ class Cancelled(Exception):
     pass
 
 
+def _think_field(model, think):
+    """Ollama `think` value: gpt-oss ignores booleans and only takes a level, so off means the lowest."""
+    if "gpt-oss" in (model or "").lower():
+        return "low" if think is False else ("medium" if think else None)
+    return bool(think)
+
+
 class InlineThinkSplitter:
     """Streams content and routes text inside <think>...</think> to the think channel.
     Handles tags split across chunks by holding back a possible partial tag."""
@@ -140,10 +147,11 @@ class OllamaBackend:
             opts["repeat_penalty"] = ov["repeat_penalty"]
         payload = {"model": model, "messages": messages, "tools": tools or [],
                    "stream": stream, "options": opts, "keep_alive": self.s.keep_alive}
-        if self.s.think is not None:
-            payload["think"] = bool(self.s.think)
-        if "think" in ov:
-            payload["think"] = ov["think"]
+        think = ov["think"] if "think" in ov else self.s.think
+        if think is not None and _think_field(model, think) is not None:
+            payload["think"] = _think_field(model, think)
+        if think is False:       # off means off, even for models that think regardless of the flag
+            on_think = None
         url = f"{self.host}/api/chat"
         timeout = self.s.api_timeout if stream else 900
         try:
@@ -174,6 +182,8 @@ class OllamaBackend:
                 sp.feed(c); sp.flush()
                 msg["content"] = "".join(sp.content)
                 msg["thinking"] = (msg.get("thinking") or "") + "".join(sp.thinking)
+            if think is False:
+                msg.pop("thinking", None)
             return {"message": msg, "prompt_eval_count": d.get("prompt_eval_count"),
                     "eval_count": d.get("eval_count"), "done_reason": d.get("done_reason")}
         splitter = InlineThinkSplitter(on_token, on_think)
@@ -207,7 +217,7 @@ class OllamaBackend:
                 if m.get("content"):
                     splitter.feed(m["content"])
                 th = m.get("thinking") or m.get("reasoning_content")
-                if th:
+                if th and think is not False:
                     thinks.append(th)
                     if on_think:
                         on_think(th)
@@ -230,7 +240,7 @@ class OllamaBackend:
         splitter.flush()
         msg = {"role": "assistant", "content": "".join(splitter.content)}
         think_txt = "".join(thinks) + "".join(splitter.thinking)
-        if think_txt:
+        if think_txt and think is not False:
             msg["thinking"] = think_txt
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -305,9 +315,21 @@ class OpenAIBackend:
             payload["temperature"] = ov["temperature"]
         if "repeat_penalty" in ov:
             payload["frequency_penalty"] = 0.5     # no repeat_penalty in the OpenAI schema
+        think = ov["think"] if "think" in ov else self.s.think
+        if think is not None:
+            payload["reasoning_effort"] = "medium" if think else "none"
+        if think is False:
+            on_think = None
+        url = f"{self.host.rstrip('/')}/chat/completions"
         try:
-            resp = _post(f"{self.host.rstrip('/')}/chat/completions", payload,
-                         self.s.api_timeout, self._headers())
+            try:
+                resp = _post(url, payload, self.s.api_timeout, self._headers())
+            except urllib.error.HTTPError as e:
+                if "reasoning_effort" in payload and e.code == 400:
+                    payload.pop("reasoning_effort")    # server doesn't know the field: retry once
+                    resp = _post(url, payload, self.s.api_timeout, self._headers())
+                else:
+                    raise
         except urllib.error.HTTPError as e:
             raise _http_error(e)
         except urllib.error.URLError as e:
@@ -338,7 +360,7 @@ class OpenAIBackend:
                     if d.get("content"):
                         splitter.feed(d["content"])
                     rc = d.get("reasoning_content") or d.get("reasoning")
-                    if rc:
+                    if rc and think is not False:
                         thinks.append(rc)
                         if on_think:
                             on_think(rc)
@@ -354,7 +376,7 @@ class OpenAIBackend:
         splitter.flush()
         msg = {"role": "assistant", "content": "".join(splitter.content)}
         t = "".join(thinks) + "".join(splitter.thinking)
-        if t:
+        if t and think is not False:
             msg["thinking"] = t
         if calls:
             tcs = []
