@@ -22,7 +22,7 @@ souls short (the picker shows the token cost).
 import os
 import re
 
-from . import config
+from . import config, osutil
 
 PKG_SOULS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builtin_souls")
 MAX_CHARS = 4000
@@ -122,8 +122,10 @@ def create(name, workdir=None, project=False, desc="my custom soul"):
 
 
 def editor_cmd():
+    """argv of the first usable editor ($VISUAL, $EDITOR, then the platform default), or None."""
     import shutil
-    for c in (os.environ.get("VISUAL"), os.environ.get("EDITOR"), "nano", "vim", "vi"):
-        if c and shutil.which(c.split()[0]):
-            return c
+    for c in (os.environ.get("VISUAL"), os.environ.get("EDITOR"), *osutil.EDITORS):
+        argv = osutil.split_cmd(c)
+        if argv and (os.path.isfile(argv[0]) or shutil.which(argv[0])):
+            return argv
     return None

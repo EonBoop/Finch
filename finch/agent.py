@@ -6,7 +6,7 @@ import platform
 import time
 import uuid
 
-from . import config, heuristics as H, souls, tools as T
+from . import config, heuristics as H, osutil, souls, tools as T
 from .llm import Cancelled, LLMError, model_params_b
 
 SYSTEM = """You are Finch, an autonomous agent working in a workspace directory on the user's machine.
@@ -19,7 +19,7 @@ RULES:
 - Work only inside the working directory with relative paths. Never cd elsewhere or invent paths like /workspace.
 - Home directory: {home}. To save outside the workspace (e.g. {home}/Desktop) use the real absolute path; the user will confirm.
 - Be concise in text; put large content in tool arguments. Call finish only when answered or fully verified done.
-System: {os}; shell: bash; python: {python}.
+System: {os}; shell: {shell}; python: {python}.
 Working directory (all commands and relative paths run here): {workdir}"""
 
 CHAT_SYSTEM = """You are Finch, a local AI assistant talking with the user.
@@ -140,7 +140,10 @@ class Agent:
             base = CHAT_SYSTEM.format(workdir=wd)
         else:
             base = SYSTEM.format(home=os.path.expanduser("~"), workdir=wd, python=os.path.basename(self.s.python),
-                                 os=f"{platform.system()} {platform.release().split('-')[0]}")
+                                 os=f"{platform.system()} {platform.release().split('-')[0]}",
+                                 shell=osutil.shell_name())
+            if osutil.shell_hint():
+                base += "\n" + osutil.shell_hint()
         proj = os.path.join(wd, "FINCH.md")
         if not qa and os.path.isfile(proj):
             base += "\n\nProject notes (FINCH.md):\n" + T.read_text(proj)[:3000]
@@ -156,6 +159,8 @@ class Agent:
     def _tool_def(self, name):
         if name == "read_file" and self.s.on("office_extract"):
             return T.READ_FILE_OFFICE
+        if name == "enable_tools":
+            return T.enable_tools_def(self.s)
         return T.ALL_BUILTIN[name]
 
     def tool_surface(self, qa, cats, extra, disabled):
@@ -163,7 +168,7 @@ class Agent:
         offline = self.s.offline
         if qa:
             return [self._tool_def(n) for n in READ_ONLY_CHAT_TOOLS
-                    if not (offline and n in T.ONLINE_TOOLS)]
+                    if not (offline and n in T.ONLINE_TOOLS) and self.s.tool_on(n)]
         if not self.s.on("flat_prefill"):
             names = set(T.ALL_BUILTIN)
         else:
@@ -171,7 +176,9 @@ class Agent:
             for c in cats:
                 names.update(H.CATEGORY_TOOLS.get(c, []))
             names.update(n for n in extra if n in T.ALL_BUILTIN)
-        names -= disabled
+        names = {n for n in names - disabled if self.s.tool_on(n)}
+        if "skills" in names and not any(self.s.skill_on(i["name"]) for i in T.skill_infos(self.tb.workdir)):
+            names.discard("skills")
         if offline:
             names -= T.ONLINE_TOOLS
         if "mcp_call" in names and not (self.mcp and self.mcp.config()):
@@ -181,7 +188,7 @@ class Agent:
         if self.mcp and self.mcp.config():
             try:
                 defs += [d for d in self.mcp.tool_defs(self._turn_task, extra)
-                         if d["function"]["name"] not in disabled]
+                         if d["function"]["name"] not in disabled and self.s.tool_on(d["function"]["name"])]
             except Exception:
                 pass
         return defs
@@ -544,6 +551,8 @@ class Agent:
                             pnote(f"⚠️ {name} is disabled and you keep calling it. The ban is permanent for this "
                                   f"task. Switch actions now: create_file to write output, read_file/list_dir to "
                                   f"inspect what exists.")
+                    elif not s.tool_on(name) and (is_mcp or name in T.ALL_BUILTIN):
+                        res = T.off_msg(name)    # turned off by the user: never auto-loaded, never unlocked
                     elif name not in active and not is_mcp and name not in T.ALL_BUILTIN:
                         res = (f"[unknown tool: {name}. Available tools: "
                                f"{', '.join(sorted(active))}]")
@@ -607,7 +616,7 @@ class Agent:
                                 "syntax error" in res.lower() or "import: command not found" in res.lower()):
                             st["bash_teach"] += 1
                             pnote("Tip: run_bash runs shell commands, not Python. Write the code to a .py file "
-                                  "with create_file, then run_bash: python3 file.py")
+                                  f"with create_file, then run_bash: {os.path.basename(self.s.python) or osutil.PY} file.py")
                         fail_count[name] = fail_count.get(name, 0) + 1
                         if fail_count[name] >= 3:
                             fail_count[name] = 0
@@ -784,6 +793,9 @@ class Agent:
         added, unknown = [], []
         for n in names:
             n = T.ALIASES.get(str(n), str(n))
+            if not self.s.tool_on(n) or "mcp:" + n in self.s.tools_off:      # a tool, or a whole MCP server
+                unknown.append(n + " (turned off by the user)")
+                continue
             if n in disabled:
                 disabled.discard(n)        # explicit enable unlocks an anti-loop ban (the promise must be true)
             if n in T.ALL_BUILTIN or (self.mcp and (self.mcp.is_tool(n) or n in self.mcp.config())):
@@ -797,8 +809,9 @@ class Agent:
                 unknown.append(n)
         note = ""
         if unknown:
-            note += (f" Unknown tool names (cannot enable): {', '.join(unknown)}. Advanced tools: "
-                     f"{', '.join(t['function']['name'] for t in T.ADVANCED_TOOLS)}.")
+            adv = [t["function"]["name"] for t in T.ADVANCED_TOOLS]
+            note += (f" Cannot enable: {', '.join(unknown)}. Advanced tools: "
+                     f"{', '.join(n for n in adv if self.s.tool_on(n))}.")
         if not added and not unknown:
             note = " Nothing to enable: the tools you asked for are already available. Call them directly."
         return f"[enabled tools: {', '.join(added) or '(none)'}]{note}"
@@ -900,8 +913,11 @@ class Agent:
 
     def _answered_by_reading(self):
         """Analysis tasks (read -> explain) legitimately finish without writing anything."""
-        return any(m.get("role") == "assistant" and len(str(m.get("content", ""))) > 200
-                   for m in self.session.messages[-6:])
+        d, a = T.todo_progress(self.tb.todo)
+        # a fully ticked plan plus any answer text is a delivered answer, however short ("The count is 2.")
+        floor = 0 if a and d == a else 200
+        return any(m.get("role") == "assistant" and not H.semantically_empty(str(m.get("content", "")))
+                   and len(str(m.get("content", ""))) > floor for m in self.session.messages[-6:])
 
     def _ws_note(self):
         return (f" Your working directory (absolute) is {self.tb.workdir}; all deliverables go inside it, "

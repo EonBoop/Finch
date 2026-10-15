@@ -10,11 +10,12 @@ model asks via enable_tools). Probe results are cached on disk: probing spawns p
 """
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
 
-from . import config
+from . import config, osutil
 
 MANIFEST_CACHE = os.path.join(config.FINCH_HOME, "mcp_manifest_cache.json")
 TTL = 300
@@ -34,10 +35,12 @@ class StdioServer:
             return
         env = dict(os.environ)
         env.update(self.cfg.get("env") or {})
-        self.proc = subprocess.Popen([self.cfg["command"], *self.cfg.get("args", [])],
+        cmd = self.cfg["command"]
+        cmd = shutil.which(cmd) or cmd      # Windows: `npx` is npx.cmd, which Popen won't find by name
+        self.proc = subprocess.Popen([cmd, *self.cfg.get("args", [])],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, env=env, cwd=self.cfg.get("cwd"),
-                                     text=True, encoding="utf-8", bufsize=1, start_new_session=True)
+                                     text=True, encoding="utf-8", bufsize=1, **osutil.new_group())
         self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                  "clientInfo": {"name": "finch", "version": "0.1"}})
         self._notify("notifications/initialized")

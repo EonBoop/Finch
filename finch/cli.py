@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from . import __version__, config, heuristics as H, scheduler as SCH, souls, themes, tools as T, tricks as TR
+from . import __version__, config, heuristics as H, osutil, scheduler as SCH, souls, themes, tools as T, tricks as TR
 from .agent import Agent, Session
 from .llm import make_backend
 from .mcp import MCPManager
@@ -22,9 +22,10 @@ from .ui import THEME, PlainUI, TerminalUI, banner
 
 COMMANDS = {
     "/help": "show this help",
-    "/settings": "settings menu: model, context, thinking, tricks, theme",
+    "/settings": "settings menu: model, context, thinking, tricks, tools, skills, theme",
     "/theme": "pick a theme (live preview), or /theme dracula",
     "/soul": "switch persona (interactive) · /soul <name> · off · list · show · new <name> · edit",
+    "/profile": "settings profiles (interactive) · /profile <name> loads · save <name> · list · rm <name>",
     "/tricks": "toggle harness tricks (interactive), /tricks list, or /tricks crawl_guard off",
     "/schedule": "scheduled jobs (interactive) · /schedule <when> <task> · list · new · run · pause · resume · rm · log",
     "/model": "list models or switch: /model gemma4:12b",
@@ -39,8 +40,8 @@ COMMANDS = {
     "/sessions": "list saved sessions",
     "/resume": "resume a session: /resume [number|id]",
     "/cd": "change working directory: /cd path",
-    "/tools": "show the tool surface and MCP servers",
-    "/skills": "list skills",
+    "/tools": "toggle tools (interactive), /tools list, or /tools run_bash off",
+    "/skills": "toggle skills (interactive), /skills list, or /skills bug_fix off",
     "/memory": "show long-term memory",
     "/offline": "toggle offline mode (web tools not assembled)",
     "/unsafe": "toggle the behaviour-tiering safety ring (ring 2)",
@@ -81,6 +82,11 @@ class App:
     def __init__(self, args):
         config.ensure_dirs()
         self.s = config.load_settings()
+        if args.profile:
+            try:
+                config.apply_profile(self.s, config.load_profile(args.profile))
+            except ValueError as e:
+                sys.exit(f"finch: {e}")
         if args.host:
             self.s.host = config.normalize_host(args.host)
         if args.model:
@@ -174,6 +180,61 @@ class App:
             self.ui.notice(f"{m} does not advertise tool support; Finch will salvage text-format calls", "warn")
         self.ui.notice(f"model set to {m}", "ok")
 
+    def load_profile(self, name):
+        """Apply a saved profile live and make it the current config. Raises ValueError."""
+        s = self.s
+        data = config.load_profile(name)
+        conn = (s.host, s.backend, s.openai_base_url, s.openai_api_key)
+        config.apply_profile(s, data)
+        if (s.host, s.backend, s.openai_base_url, s.openai_api_key) != conn:
+            self.backend = self.agent.llm = make_backend(s)
+        if not self.apply_theme(s.theme):
+            self.apply_theme(themes.DEFAULT)
+        self.ui.verbose = s.verbose
+        self.agent.session.model = s.model
+        config.save_settings(s)
+        return f"profile '{name}' loaded · {s.model or 'no model'} · ctx {s.num_ctx // 1024}K · theme {s.theme}"
+
+    def profile_command(self, arg):
+        ui = self.ui
+        a = arg.split()
+        try:
+            if not a:
+                self.open_settings(tab="Profiles")
+            elif a[0] in ("list", "ls") and len(a) == 1:
+                self.show_profiles()
+            elif a[0] == "save" and len(a) == 2:
+                path = config.save_profile(self.s, a[1])
+                ui.notice(f"saved profile '{a[1]}'", "ok")
+                self.console.print(Text(f"  {path}", style="dim"))
+            elif (a[0] == "load" and len(a) == 2) or (len(a) == 1 and a[0] not in ("save", "load", "rm", "delete")):
+                ui.notice(self.load_profile(a[-1]), "ok")
+            elif a[0] in ("rm", "delete") and len(a) == 2:
+                ok = config.delete_profile(a[1])
+                ui.notice(f"deleted profile '{a[1]}'" if ok else f"no profile named '{a[1]}'", "ok" if ok else "error")
+            else:
+                ui.notice("usage: /profile | /profile <name> | save <name> | load <name> | list | rm <name>", "error")
+        except ValueError as e:
+            ui.notice(str(e), "error")
+
+    def show_profiles(self):
+        profs = config.list_profiles()
+        if not profs:
+            self.console.print(Text(f"no profiles yet: /profile save <name> stores the current settings "
+                                    f"({config.PROFILES_DIR})", style="dim"))
+            return
+        t = Table.grid(padding=(0, 2))
+        for p in profs:
+            diff = config.profile_diff(self.s, p["data"])
+            d = p["data"]
+            t.add_row(Text(("  ● " if not diff else "    ") + p["name"], style="ok" if not diff else "bold"),
+                      Text(f"{d.get('model') or '-'} · ctx {int(d.get('num_ctx') or 0) // 1024}K · "
+                           f"theme {d.get('theme', '-')} · soul {d.get('soul') or 'none'}", style="dim"),
+                      Text("current" if not diff else "differs: " + ", ".join(diff[:5])
+                           + (" …" if len(diff) > 5 else ""), style="dim"))
+        self.console.print(t)
+        self.console.print(Text("load: /profile <name> · save: /profile save <name> · or use /settings", style="dim"))
+
     def apply_theme(self, name):
         if name not in themes.THEMES:
             return False
@@ -187,7 +248,7 @@ class App:
         wd = self.tb.workdir
         a = arg.split(maxsplit=1)
         if not a:
-            self.open_settings(tab=3)
+            self.open_settings(tab="Soul")
             return
         sub = a[0].lower()
         if sub == "list":
@@ -240,6 +301,68 @@ class App:
         self.console.print(t)
         n = sum(1 for k in TR.KEYS if self.s.on(k))
         self.console.print(Text(f"{n}/{len(TR.KEYS)} on · toggle: /tricks <key> on|off · /tricks all on|off · "
+                                f"or use /settings", style="dim"))
+
+    def tool_keys(self):
+        return ([n for n in T.ALL_BUILTIN if n not in config.LOCKED_TOOLS]
+                + ["mcp:" + srv for srv in self.mcp.config()])
+
+    def toggle_command(self, arg, kind, tab, show, keys, setter):
+        """/tools and /skills: no argument opens the settings tab; list; <name>|all on|off."""
+        a = arg.split()
+        if not a:
+            self.open_settings(tab=tab)
+        elif a == ["list"]:
+            show()
+        elif len(a) == 2 and a[1] in ("on", "off"):
+            names = keys if a[0] == "all" else [k for k in keys if a[0] in (k, "mcp:" + k)]
+            if not names:
+                hint = " (always on)" if a[0] in config.LOCKED_TOOLS else f". /{kind}s list shows them"
+                self.ui.notice(f"unknown {kind} '{a[0]}'{hint}", "error")
+                return
+            for k in names:
+                setter(k, a[1] == "on")
+            config.save_settings(self.s)
+            self.ui.notice(f"{a[0]} → {a[1]}", "ok" if a[1] == "on" else "warn")
+        else:
+            self.ui.notice(f"usage: /{kind}s | /{kind}s list | /{kind}s <name> on|off | /{kind}s all on|off", "error")
+
+    def _toggle_row(self, t, name, on, desc):
+        t.add_row(Text(("  ● " if on else "  ○ ") + name, style="ok" if on else "err"), Text(desc, style="dim"))
+
+    def show_tools(self):
+        from .agent import READ_ONLY_CHAT_TOOLS
+        for head, defs in (("core", T.CORE_TOOLS), ("advanced (category routing / enable_tools)", T.ADVANCED_TOOLS)):
+            t = Table.grid(padding=(0, 2))
+            for d in defs:
+                n = d["function"]["name"]
+                self._toggle_row(t, n, self.s.tool_on(n), d["function"]["description"][:90]
+                                 + (" (always on)" if n in config.LOCKED_TOOLS else ""))
+            self.console.print(Text(head, style="accent"), t)
+        cfg = self.mcp.config()
+        if cfg:
+            man = self.mcp.manifest(force=True)
+            t = Table.grid(padding=(0, 2))
+            for srv in cfg:
+                tl = man.get(srv) or []
+                err = (man.get("_errors") or {}).get(srv)
+                self._toggle_row(t, srv, "mcp:" + srv not in self.s.tools_off,
+                                 ", ".join(x["name"] for x in tl) or f"(error: {err})")
+            self.console.print(Text("mcp servers", style="accent"), t)
+        else:
+            self.console.print(Text(f"mcp: none configured ({config.MCP_CONFIG})", style="dim"))
+        n = sum(1 for k in self.tool_keys() if k not in self.s.tools_off)
+        self.console.print(Text(f"{n}/{len(self.tool_keys())} on · chat mode offers {', '.join(READ_ONLY_CHAT_TOOLS)} · "
+                                f"toggle: /tools <name> on|off · /tools all on|off · or use /settings", style="dim"))
+
+    def show_skills(self):
+        infos = T.skill_infos(self.tb.workdir)
+        t = Table.grid(padding=(0, 2))
+        for i in infos:
+            self._toggle_row(t, i["name"], self.s.skill_on(i["name"]), f"{i['scope']:<9} {i['desc']}")
+        self.console.print(t if infos else Text(f"no skills (add .md files to {config.SKILLS_DIR_HOME})", style="dim"))
+        n = sum(1 for i in infos if self.s.skill_on(i["name"]))
+        self.console.print(Text(f"{n}/{len(infos)} on · toggle: /skills <name> on|off · /skills all on|off · "
                                 f"or use /settings", style="dim"))
 
     # ---------------- sessions ----------------
@@ -384,22 +507,10 @@ class App:
             else:
                 ui.notice(f"not a directory: {p}", "error")
         elif cmd == "/tools":
-            from .agent import READ_ONLY_CHAT_TOOLS
-            self.console.print(Text("core: " + ", ".join(t["function"]["name"] for t in T.CORE_TOOLS), style="dim"))
-            self.console.print(Text("advanced (enable_tools / category routing): "
-                                    + ", ".join(t["function"]["name"] for t in T.ADVANCED_TOOLS), style="dim"))
-            self.console.print(Text("chat mode: " + ", ".join(READ_ONLY_CHAT_TOOLS), style="dim"))
-            cfg = self.mcp.config()
-            if cfg:
-                man = self.mcp.manifest(force=True)
-                for srv in cfg:
-                    tl = man.get(srv) or []
-                    err = (man.get("_errors") or {}).get(srv)
-                    self.console.print(Text(f"mcp {srv}: " + (", ".join(t["name"] for t in tl) or f"(error: {err})"), style="dim"))
-            else:
-                self.console.print(Text(f"mcp: none configured ({config.MCP_CONFIG})", style="dim"))
+            self.toggle_command(arg, "tool", "Tools", self.show_tools, self.tool_keys(), s.set_tool)
         elif cmd == "/skills":
-            self.console.print(Text(T.list_skills(self.tb.workdir), style="dim"))
+            self.toggle_command(arg, "skill", "Skills", self.show_skills,
+                                [i["name"] for i in T.skill_infos(self.tb.workdir)], s.set_skill)
         elif cmd == "/memory":
             mem = T._load_memory()
             self.console.print(Text("\n".join(f"[{m['ts']}] {m['text']}" for m in mem[-30:]) or "(empty)", style="dim"))
@@ -421,12 +532,14 @@ class App:
                 ui.notice(f"unknown theme '{arg}'. Themes: {', '.join(themes.THEMES)}", "error")
         elif cmd == "/soul":
             self.soul_command(arg)
+        elif cmd in ("/profile", "/profiles"):
+            self.profile_command(arg)
         elif cmd == "/schedule":
             self.schedule_command(arg)
         elif cmd == "/tricks":
             a = arg.split()
             if not a:
-                self.open_settings(tab=1)
+                self.open_settings(tab="Tricks")
             elif a == ["list"]:
                 self.show_tricks()
             elif len(a) == 2 and a[1] in ("on", "off"):
@@ -472,12 +585,10 @@ class App:
 
     def shell(self, cmd):
         try:
-            p = subprocess.run(cmd, shell=True, cwd=self.tb.workdir, capture_output=True, text=True,
-                               timeout=self.s.bash_timeout, executable="/bin/bash", errors="replace")
-            out = (p.stdout + p.stderr).rstrip()
-            rc = p.returncode
-        except subprocess.TimeoutExpired:
-            out, rc = "(timed out)", 124
+            rc, out, err, timed_out = T._run_proc(cmd, self.tb.workdir, self.s.bash_timeout)
+            out = (out + err).rstrip() + ("\n(timed out)" if timed_out else "")
+        except OSError as e:
+            out, rc = f"(could not run {osutil.shell_name()}: {e})", 127
         self.console.print(Text(out[-4000:] or "(no output)", style="output"))
         self.agent.session.messages.append({"role": "user", "content":
             f"[harness] The user ran a shell command.\n$ {cmd}\n[exit {rc}]\n{out[-3000:]}"})
@@ -561,7 +672,7 @@ class App:
         sub, rest = sub.lower(), rest.strip()
         try:
             if not arg.strip():
-                self.open_settings(tab=4)
+                self.open_settings(tab="Schedule")
             elif sub in ("list", "ls"):
                 self.show_jobs()
             elif sub in ("help", "?"):
@@ -659,6 +770,8 @@ class App:
         n_off = sum(1 for k in TR.KEYS if not s.on(k))
         if n_off:
             flags.append(f"{n_off} trick{'s' if n_off > 1 else ''} off")
+        if s.tools_off:
+            flags.append(f"{len(s.tools_off)} tool{'s' if len(s.tools_off) > 1 else ''} off")
         if self.agent.timebox_min:
             flags.append(f"timebox {self.agent.timebox_min:.0f}m")
         if self.agent.force_mode:
@@ -675,10 +788,10 @@ class App:
                     + (f" · <tbwarn>{escape(' · '.join(flags))}</tbwarn>" if flags else "")
                     + f" · {escape(wd)}   <tbdim>/settings · /help · ctrl+d quit</tbdim>")
 
-    def open_settings(self, tab=0):
-        from .settings_menu import SettingsMenu
+    def open_settings(self, tab="General"):
+        from .settings_menu import TABS, SettingsMenu
         m = SettingsMenu(self)
-        m.tab = tab
+        m.tab = TABS.index(tab)
         m.run()
         n = sum(1 for k in TR.KEYS if self.s.on(k))
         self.ui.notice(f"settings saved · {self.s.model} · ctx {self.s.num_ctx // 1024}K · theme {self.s.theme} · "
@@ -780,6 +893,7 @@ class App:
 
 
 def main(argv=None):
+    osutil.utf8_stdio()
     ap = argparse.ArgumentParser(prog="finch", description="A local-first agent harness for small models.")
     ap.add_argument("-p", "--print", metavar="TASK", help="run one task headless and exit")
     ap.add_argument("-m", "--model")
@@ -794,6 +908,7 @@ def main(argv=None):
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--theme", choices=list(themes.THEMES))
     ap.add_argument("--soul", help="persona to use (name from /soul list, or 'none')")
+    ap.add_argument("--profile", help="start with a saved settings profile (other flags still override it)")
     ap.add_argument("--version", action="version", version=f"finch {__version__}")
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["schedule"]:

@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from difflib import SequenceMatcher
 
+from . import osutil
+
 # ---------------- Q&A vs task layering ----------------
 TASK_HINTS = ("write ", "create ", "build ", "implement", "fix ", "fix the", "debug", "analyze", "analyse",
               "clean ", "optimize", "optimise", "refactor", "generate", "design ", "audit ", "review ",
@@ -316,8 +318,8 @@ def pytest_hint(output):
 def run_test_guard(workdir, python):
     """('pass'|'fail'|'skip', hint). pytest -> unittest fallback -> skip if no python."""
     def _run(args, env=None):
-        return subprocess.run(args, cwd=workdir, capture_output=True, text=True, timeout=300,
-                              errors="replace", stdin=subprocess.DEVNULL, env=env)
+        return subprocess.run(args, cwd=workdir, capture_output=True, text=True, timeout=300, encoding="utf-8",
+                              errors="replace", stdin=subprocess.DEVNULL, env=osutil.child_env(env))
 
     def _broken(pr, out):
         return pr.returncode in (127, 9009) or any(m in out.lower() for m in _TEST_ENV_ERR)

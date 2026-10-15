@@ -46,7 +46,8 @@ Useful flags: `-C dir`, `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `
 | `finch/skills/*.md` | Built-in skills: bug_fix, test_driven, python_project, web_research, data_analysis, code_review. |
 | `scripts/pty_drive.py` | Dev tool: drives the REPL in a pty (pexpect + pyte, answers CPR) and prints the screen. Use it to verify menus/toolbars. |
 | `CLAUDE.md` | Local only (gitignored). Short orientation for Claude: commands, layout, invariants, gotchas, how this user works. |
-| `tests/test_harness.py` | 152 tests, including a scripted `FakeLLM` that drives the full loop. |
+| `finch/osutil.py` | Every OS difference: shell choice and argv, process groups / tree kill, pid liveness, file lock, retried `os.replace`, console decoding, python discovery, UTF-8 child env. |
+| `tests/test_harness.py` | 162 tests, including a scripted `FakeLLM` that drives the full loop. |
 
 Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `mcp.json`, `skills/`,
 `cache/`, `history` and `schedule/` (jobs.json, logs/, daemon.pid, daemon.log, busy/). Per-workdir state lives in `<workdir>/.finch/`: `backups/`, `trash/` and `sources/` (fetched web pages).
@@ -278,3 +279,84 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
   on Ollama, and models that think regardless of the flag still streamed their reasoning.
 - `llm.py`: Ollama sends `"low"` for off on gpt-oss (`_think_field`); the OpenAI backend sends `reasoning_effort` ("none"/"medium"),
   retrying once without it on HTTP 400. When think is off, any thinking (channel or inline `<think>`) is dropped from the UI and the message.
+
+## Follow-up: OS agnostic (Linux, macOS, Windows)
+
+Goal: run Finch natively on Windows as well as Linux without configuration. All platform branching now lives in
+`finch/osutil.py`; no other module tests `os.name`.
+
+| POSIX-only before | Now |
+|---|---|
+| `run_bash` / `!cmd` hardcoded `/bin/bash` | `osutil.shell_path()`: bash on POSIX; on Windows Git Bash > PowerShell > cmd. `System32\bash.exe` and WindowsApps are skipped (that is the WSL launcher: commands would run on a different machine). `FINCH_SHELL` overrides. The system prompt names the shell (`shell: {shell}`), plus a one-line syntax hint for PowerShell/cmd. |
+| `start_new_session` + `os.killpg` | `new_group`/`hidden_group`/`detached` Popen kwargs and `kill_tree` (`taskkill /F /T` on Windows). `run_bash` children get their own hidden console on Windows, so a code page change or ctrl+c in the child never reaches the REPL's console. |
+| `fcntl.flock` on the job store | `osutil.lock`/`unlock` (`msvcrt.locking` on Windows). `os.replace` is retried (Windows refuses while a reader has the file open) and `scheduler._read` retries `PermissionError`. |
+| `os.kill(pid, 0)` + `/proc/<pid>/stat` | `osutil.pid_alive`: on Windows `OpenProcess` + `GetExitCodeProcess` through ctypes. On Windows **`os.kill(pid, 0)` terminates the process**, so it is never called there. |
+| Daemon stopped by SIGTERM | `stop_daemon` also writes `schedule/daemon.stop`, which the daemon polls every 0.5 s (Windows can't deliver SIGTERM to another process); SIGTERM is still sent on POSIX. A hard terminate is the fallback after 4 s. |
+| Locale encodings | Children get `PYTHONUTF8=1` (`osutil.child_env`): without it, a job's log redirected on Windows is cp1252 and crashes on `✓`. Finch's own redirected stdout/stderr switch to UTF-8 (`utf8_stdio`). PowerShell/cmd are told to emit UTF-8 (PowerShell 5.1 otherwise turns `✓` into `√`). Output that isn't UTF-8 is decoded with the OEM code page on Windows. |
+| `python3` everywhere | `osutil.find_python()` skips the Microsoft Store stub, which opens the Store instead of running anything. Hints say `python` on Windows (`osutil.PY`). |
+| `$EDITOR.split()`, nano/vim only | `osutil.split_cmd` (an unquoted `C:\Program Files\...` path works); Notepad on Windows. |
+| MCP `command: npx` | Resolved with `shutil.which`, because on Windows it is `npx.cmd`, which `Popen` won't find by name. |
+| Safety | `cd C:\` / `Set-Location D:` / `pushd \` count as leaving the workdir, and backslashes count as path separators in the delete-glob and in-place-edit snapshot checks. |
+
+- Verified on this machine: 162 tests on Linux **and natively on Windows** (Windows Python 3.11 from WSL, scratch venv in
+  `%TEMP%`). On Windows: shell detection picked Git Bash rather than the WSL launcher, and python detection picked Python 3.11
+  rather than the Store stub. A live gemma4:12b task wrote code and ran `python -m unittest` through Git Bash. `finch schedule
+  start/status/stop` worked. A scheduled job ran end to end (detached supervisor, hidden child, UTF-8 log). PowerShell and cmd
+  fallbacks returned `✓ é` intact and tree-killed on timeout. Linux: live gemma4:12b run and pty snapshot (`!cmd`) unchanged.
+- Not verified: the interactive REPL in a real Windows console (prompt_toolkit supports it, but it can't be driven from WSL),
+  macOS, and PowerShell 7 (`pwsh`, not installed here; same code path as 5.1). `scripts/pty_drive.py` stays Linux-only (pexpect).
+- Tests that assumed Linux were made portable: `encoding="utf-8"` on reads, `sys.executable` instead of `python3`/`true`.
+
+## Follow-up: toggleable tools and skills
+
+Goal: every tool and skill can be switched on and off from `/settings`, like the tricks.
+
+- `config.Settings`: `tools_off` (built-in names and `"mcp:<server>"`) and `skills_off` lists, persisted;
+  `tool_on(name)` (a flat MCP tool `server.tool` follows its server) and `skill_on(name)`. Lists of what's *off*,
+  so new tools and skills default to on. `LOCKED_TOOLS = ("finish",)`: the finish gates hang off it, so like the
+  hard safety ring it isn't switchable (`set_tool` ignores it).
+- Enforced at every entry: `agent.tool_surface` (task, chat and no-flat-prefill surfaces, MCP defs), the agent's
+  dispatch (an off tool is refused before auto-enable, so it's never loaded on the fly), `_enable_tools` (reports
+  "turned off by the user" and doesn't lift the ban the way it lifts anti-loop bans), and `ToolBox.run`
+  after alias mapping (covers `batch_tools`, `bash`→`run_bash`, salvaged calls) plus `t_mcp_call`.
+- Not a trick: tricks are harness mechanisms; these switch off capabilities. They don't go in `tricks.TRICKS`.
+- Prompt cost: `enable_tools` advertises only the advanced tools that are on (`tools.enable_tools_def`); with nothing
+  off it returns the original def, so the default prompt is byte-identical. The `skills` tool leaves the surface
+  when every skill is off.
+- Skills: `tools.skill_infos()` returns name/desc/scope/path with project > user > built-in precedence, used by the
+  Skills tab, `/skills list`, and the `skills` tool (`list_skills`/`load_skill` take the off list).
+- Settings tabs are now General · Tricks · Tools · Skills · Theme · Soul · Schedule; tab indices are named
+  constants (`settings_menu.TOOLS` …) and `cli.open_settings` takes a tab name, so nothing hardcodes a number.
+  A `locked` item kind renders `finish` as "● on always". `/tools` and `/skills` with no argument open their tab,
+  and keep `list` / `<name> on|off` / `all on|off` forms (`App.toggle_command`).
+- Known limitation: the anti-loop nudges name tools ("write it with create_file", "run_bash: python …") whether or not
+  they're on. A model with those tools off is told to use the tool, then refused with "turned off by the user".
+- **Test hazard fixed:** the `finch_home` fixture didn't patch `config.CONFIG_FILE` (or `SKILLS_DIR_HOME`), so any test
+  calling `save_settings` wrote the developer's real `~/.finch/config.json`. That happened once in this session, it
+  reset the user's model/theme/think and had to be restored by hand. The fixture now patches both.
+- Verified: 171 tests (9 new); pty walkthrough of the Tools tab (toggle, locked finish, 18/19 count), the Skills tab,
+  the General nav counts, the save on esc, `/tools list`, `/skills code_review off`, `/skills list`, and the toolbar
+  "1 tool off". Live gemma4:12b with `run_bash`/`run_python` off: "Run a shell command to count the lines…" was done with
+  read_file + create_file (count.txt = 4) and passed the finish gates.
+
+## Follow-up: settings profiles
+
+Goal: save the whole settings state under a name and switch between them.
+
+- A profile is `{k: value for k in config.PERSISTED}` in `~/.finch/profiles/<name>.json` (`config.PROFILES_DIR`). Using
+  `PERSISTED` as the schema means a new persisted setting is automatically part of profiles. Runtime-only state
+  (routing override, timebox, `unattended`) is deliberately not in it, and `load_profile` drops any key outside
+  `PERSISTED`, so a hand-edited profile can't switch on `unattended`/`allow_env_mutation`.
+- `config`: `save_profile` (validates the name: `[\w][\w.-]{0,47}`, plus Windows reserved names like `con`),
+  `load_profile` (ValueError on missing/unreadable), `apply_profile` (deep copies; missing keys keep their current value),
+  `profile_diff` (lists compared as sets, so `tools_off` order doesn't matter), `delete_profile`, `list_profiles`.
+- Loading in the REPL is `App.load_profile`: it applies the profile, rebuilds the backend when host/backend/URL/key changed
+  (`agent.llm` too), re-applies the theme and verbose, updates the session model, and saves config.json. So "load" means
+  "make this my config". `--profile` at startup applies before the other flags and doesn't save.
+- Settings tab 8 (appended so the 1–7 keys didn't move again): save action (name prompt, overwrite confirmation), one
+  row per profile with a summary and "✓ current", and enter → `choose()` Load / Update / Delete. Uses the same
+  `*_request` + `application.exit` pattern as souls and jobs. `/profile` mirrors it.
+- Not done: scheduled jobs can't name a profile (they keep their own model/soul overrides and otherwise use config.json).
+- Verified: 183 tests (12 new); pty: save two profiles, `/profile list` (current + "differs: num_ctx, theme"), Profiles tab
+  render, load from the tab (ctx 64K→32K, hermes→claude live), `/profile big`, unknown name error, config.json updated.
+  `finch --profile work -p` ran headless and left config.json unchanged; `--profile nope` exits 1 with a message.

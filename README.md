@@ -48,6 +48,27 @@ export OLLAMA_HOST=http://0.0.0.0:11434      # 0.0.0.0 is rewritten to 127.0.0.1
 .venv/bin/finch -m gemma4:12b -p "task"      # headless: one task, then exit (non-zero if not finished)
 ```
 
+On **Windows** (native, no WSL), from PowerShell or cmd:
+
+```powershell
+cd finch
+py -m venv .venv; .venv\Scripts\pip install -e .
+.venv\Scripts\finch -m gemma4:12b          # Ollama for Windows listens on 127.0.0.1:11434 by default
+```
+
+Finch runs the same on Linux, macOS and Windows; nothing needs configuring. What differs:
+
+- **Shell.** `run_bash` (and `!cmd` in the REPL) uses bash on Linux/macOS. On Windows it uses **Git Bash** if
+  [Git for Windows](https://git-scm.com/download/win) is installed (recommended: small models write bash), otherwise
+  PowerShell, otherwise cmd. In those last two cases the model is told which shell it has. It never uses
+  `System32\bash.exe`, which runs commands inside WSL instead of on Windows. To choose a shell yourself, set `FINCH_SHELL`
+  (`FINCH_SHELL=pwsh`, or a full path).
+- **Python.** `run_python` and the test guard use `python3` on Linux/macOS and `python`/`py` on Windows, skipping the
+  Microsoft Store `python3.exe` stub.
+- **Editor / pager.** `$VISUAL`/`$EDITOR` (paths with spaces work), else nano/vim on Linux and Notepad on Windows.
+  Without `less`, logs are shown inline.
+- Config lives in `~/.finch` on every platform (`C:\Users\<you>\.finch` on Windows); `FINCH_HOME` overrides it.
+
 Options: `-C dir` (working directory), `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `--offline`,
 `--resume [id]`, `-y` (auto-approve permission prompts; the hard safety rings stay on), `-v`.
 Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|when|test|start|stop|status`
@@ -57,11 +78,14 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 
 | | |
 |---|---|
-| `/settings` | **settings menu**: General · Tricks · Theme · Soul · Schedule. The "›" rows on General (or keys 1–5, tab) open the other tabs; ↑↓ move, ←→ change, enter select, backspace back, esc save & close |
+| `/settings` | **settings menu**: General · Tricks · Tools · Skills · Theme · Soul · Schedule · Profiles. The "›" rows on General (or keys 1–8, tab) open the other tabs; ↑↓ move, ←→ change, enter select, backspace back, esc save & close |
 | `/theme [name]` | pick a theme (↑↓ live preview, enter select, esc cancel) or switch directly. 18 themes in three groups: **Finch** (claude, ocean, forest, dracula, solarized-light, high-contrast, mono), **Hermes Agent** (hermes, ares, poseidon, charizard, slate: Hermes's palettes, glyphs like ☤ and `┊`, and its spinner faces/verbs) and **Editor palettes** (nord, gruvbox, tokyo-night, catppuccin, monokai, rose-pine) |
 | `/soul` | switch persona (interactive Soul tab) · `/soul <name>` · `/soul off` · `/soul list` · `/soul show` · `/soul new <name>` · `/soul edit [name]` |
 | `/schedule` | scheduled jobs (interactive Schedule tab) · `/schedule <when> <task>` · `/schedule new` (guided) · `list` · `run` · `pause` · `resume` · `rm` · `log` · `when <job> <when>` · `daemon start\|stop\|status` |
+| `/profile` | settings profiles (interactive Profiles tab) · `/profile <name>` loads one · `/profile save <name>` · `list` · `rm <name>` |
 | `/tricks` | interactive trick toggles · `/tricks list` prints them · `/tricks <key> on\|off` · `/tricks all off` for a raw model |
+| `/tools` | interactive tool toggles (Tools tab) · `/tools list` · `/tools run_bash off` · `/tools <mcp server> off` · `/tools all on` |
+| `/skills` | interactive skill toggles (Skills tab) · `/skills list` · `/skills bug_fix off` · `/skills all off` |
 | `/model [name]` | pick or switch model (shows size + tools/thinking/vision capabilities) |
 | `/think on\|off\|auto` | thinking tri-state (`auto` = don't send the field; model default) |
 | `/ctx 64k` | context window (`num_ctx`) |
@@ -70,7 +94,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 | `/todo` `/undo` | show the plan · roll back the agent's last file change |
 | `/compact` `/clear` | summarise now · new session |
 | `/sessions` `/resume` | saved sessions (`~/.finch/sessions/`) |
-| `/cd` `/tools` `/skills` `/memory` | |
+| `/cd` `/memory` | |
 | `/offline` `/unsafe` `/verbose` `/status` `/init` | |
 | `!cmd` | run a shell command; its output is added to the conversation |
 | `@path` | mention a file: text is inlined, images are attached |
@@ -153,7 +177,7 @@ finch schedule add "daily at 9am" "check the build and write status.md" -C ~/pro
 Times are local. A time of day that has already passed means tomorrow, and a day without a time means 09:00.
 `finch schedule test "<phrase>"` (or the live preview in `/schedule new`) shows how a phrase is read and its next runs.
 
-**Managing jobs.** Use the Schedule tab in `/settings` (key 5) or `/schedule` with no arguments. It lists every job with its
+**Managing jobs.** Use the Schedule tab in `/settings` (key 7) or `/schedule` with no arguments. It lists every job with its
 next run and last result. Enter on a job opens: run now, pause/resume, view last log, edit task, change schedule, change
 folder, toggle auto-approve, delete. "Background daemon" switches the daemon on and off.
 
@@ -170,6 +194,8 @@ status bar shows the next or running job.
   job runs late if it's less than 24 hours overdue, otherwise it's marked missed.
 - **Safety:** nobody is there to answer permission prompts, so risky actions (installs, deletes outside the project,
   system changes) are **denied** unless the job has auto-approve on. The hard safety ring is always on.
+- **Windows:** the daemon and job runs are detached background processes with no console window, so closing the
+  terminal doesn't stop them. `finch schedule stop` works the same as on Linux.
 - **WSL:** the daemon only runs while the WSL VM is up. If Windows shuts WSL down when no terminal is open, jobs wait
   until a window or the daemon is running again (then the catch-up rules above apply).
 
@@ -182,19 +208,45 @@ in config.json, or `FINCH_ABLATION=key1,key2` (Mingbird's ablation names `finish
 The toolbar shows how many tricks are off. **The hard safety ring (irreversible commands) can't be
 turned off.**
 
+## Toggleable tools and skills
+
+Every built-in tool, every MCP server and every skill can be switched off too: the Tools and Skills tabs in
+`/settings` (keys 3 and 4), `/tools <name> off`, `/skills <name> off`, or `"tools_off": ["run_bash", "mcp:fs"]` /
+`"skills_off": ["bug_fix"]` in config.json. A tool that is off is left out of every prompt (task and chat mode),
+can't be loaded by `enable_tools`, auto-loading or `batch_tools`, and a call to it gets "turned off by the user".
+An MCP server is switched as a whole (all its `server.tool` tools). A skill that is off disappears from
+`skills list` and can't be loaded; with every skill off the `skills` tool itself leaves the prompt.
+**`finish` can't be turned off**: the finish gates depend on it. The toolbar shows how many tools are off.
+
+## Settings profiles
+
+A profile is a named snapshot of everything `/settings` saves: model, context window, output cap, thinking, temperature,
+keep-alive, command timeout, theme, soul, tricks, tools, skills, offline, verbose, language, and the model server
+(host, backend, OpenAI-compatible URL). Profiles live in `~/.finch/profiles/<name>.json`.
+
+- **Save:** `/profile save <name>`, or "Save current settings as a profile…" in the Profiles tab (key 8). Saving
+  under an existing name overwrites it (the tab asks first).
+- **Load:** `/profile <name>`, or enter on a profile in the Profiles tab → Load. It applies at once (theme, model,
+  and model server included) and becomes your config.json, so it's also what scheduled jobs use from then on.
+  Keys a profile doesn't contain keep their current value, so hand-written partial profiles work.
+- **For one run:** `finch --profile <name>` (with `-p` too) starts with a profile without changing config.json.
+  Other flags (`-m`, `--ctx`, …) still override it.
+- `/profile list` and the Profiles tab mark the profile that matches the current settings and say what the others
+  change ("differs: num_ctx, theme"). Enter on a profile also offers "Update it with the current settings" and delete.
+
 ## Config
 
-`~/.finch/config.json` (written by `/model`, `/ctx`, `/think`, `/offline`):
+`~/.finch/config.json` (written by `/settings` and by `/model`, `/ctx`, `/think`, `/offline`, `/tools`, `/skills`):
 
 ```json
 {"model": "gemma4:12b", "num_ctx": 32768, "think": null, "host": "http://127.0.0.1:11434", "theme": "claude",
- "tricks": {"self_check": false},
+ "tricks": {"self_check": false}, "tools_off": ["web_fetch"], "skills_off": [],
  "backend": "ollama", "openai_base_url": "http://127.0.0.1:1234/v1",
  "num_predict": 8192, "keep_alive": "30m", "bash_timeout": 120}
 ```
 
 Env overrides: `OLLAMA_HOST`, `FINCH_SOUL`, `FINCH_MODEL`, `FINCH_CTX`, `FINCH_THINK`, `FINCH_TEMP`, `FINCH_OFFLINE=1`,
-`FINCH_THEME`, `FINCH_UNSAFE=1`, `FINCH_ALLOW_ENV_MUTATION=1`, `FINCH_OLLAMA_RESTART_CMD`, `FINCH_HOME`,
+`FINCH_THEME`, `FINCH_UNSAFE=1`, `FINCH_ALLOW_ENV_MUTATION=1`, `FINCH_OLLAMA_RESTART_CMD`, `FINCH_HOME`, `FINCH_SHELL`,
 `FINCH_ABLATION=<trick keys or Mingbird ablation names>` (for experiments).
 
 MCP (`~/.finch/mcp.json`):
@@ -210,6 +262,6 @@ MCP (`~/.finch/mcp.json`):
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests
 ```
 
-152 tests, no backend needed. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
+162 tests, no backend needed; they pass on Linux and natively on Windows. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
 prints the screen (see its docstring). The suite includes a scripted fake model that drives the full loop through the finish gates, the
 anti-loop ladder, the empty-turn ladder and the chat mode. It doesn't need a running backend.

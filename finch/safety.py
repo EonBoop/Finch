@@ -52,7 +52,8 @@ SYSTEM_DIRS = ("/usr/", "/etc/", "/bin/", "/sbin/", "/boot/", "/lib/", "/lib64/"
                "/sys/", "/proc/", "/dev/", "/var/lib/", "/opt/", "\\windows\\",
                "\\program files\\", "\\system32\\", "/mnt/c/windows/")
 BASH_ESCAPE = (
-    r"(^|[\s;&|])cd\s+(/|~|\.\.)", r"\.ssh\b", r"\.aws\b", r"(^|\s)\.env\b",
+    r"(^|[\s;&|])cd\s+(/|~|\.\.)", r"(^|[\s;&|])(cd|chdir|set-location|pushd)\s+(/d\s+)?([a-z]:|\\)",
+    r"\.ssh\b", r"\.aws\b", r"(^|\s)\.env\b",
     r"\b(mv|cp|rsync)\s+[^&|;]*\s+(~|/home/|/etc/|/usr/|/opt/|/root)",
     r">\s*(~|/home/|/etc/|/usr/)", r"\btee\s+(-a\s+)?(~|/home/|/etc/|/usr/)",
     r"\bsudo\b", r"(^|\s)/mnt/[a-z]/",
@@ -143,7 +144,7 @@ class Gate:
             if not targets:
                 return "[safety net: recursive delete with no explicit target was refused. Name the exact path.]"
             for t in targets:
-                if any(ch in t for ch in "*?") and "/" not in t:
+                if any(ch in t for ch in "*?") and "/" not in t and "\\" not in t:
                     continue        # glob relative to cwd stays inside the workdir
                 _, inside = safe_path(workdir, t, self.allow_dirs)
                 if not inside:

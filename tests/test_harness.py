@@ -1,4 +1,5 @@
 import os
+import sys as _sys
 import threading
 
 import pytest
@@ -13,6 +14,9 @@ from finch.safety import Gate
 def finch_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setattr(config, "FINCH_HOME", str(home))
+    monkeypatch.setattr(config, "CONFIG_FILE", str(home / "config.json"))     # never the user's real config
+    monkeypatch.setattr(config, "SKILLS_DIR_HOME", str(home / "skills"))
+    monkeypatch.setattr(config, "PROFILES_DIR", str(home / "profiles"))
     monkeypatch.setattr(config, "SESSIONS_DIR", str(home / "sessions"))
     monkeypatch.setattr(config, "MEMORY_FILE", str(home / "memory.json"))
     monkeypatch.setattr(config, "CACHE_DIR", str(home / "cache"))
@@ -21,7 +25,7 @@ def finch_home(tmp_path, monkeypatch):
 
 def settings(**kw):
     s = config.Settings()
-    s.python = "python3"
+    s.python = _sys.executable
     s.unattended = True
     for k, v in kw.items():
         setattr(s, k, v)
@@ -356,7 +360,7 @@ from finch import themes, tricks as TR
 
 def test_every_trick_key_is_referenced_in_code():
     import pathlib
-    src = "".join(p.read_text() for p in pathlib.Path("finch").glob("*.py") if p.name != "tricks.py")
+    src = "".join(p.read_text(encoding="utf-8") for p in pathlib.Path("finch").glob("*.py") if p.name != "tricks.py")
     missing = [k for k in TR.KEYS if f'"{k}"' not in src]
     assert not missing, missing
 
@@ -488,7 +492,6 @@ def test_soul_injected_in_task_and_chat(tmp_path):
 # ---------------- scheduler ----------------
 import datetime as _dt
 import subprocess as _sp
-import sys as _sys
 import time as _time
 
 from finch import scheduler as SCH
@@ -615,7 +618,7 @@ def test_tick_claims_one_job_at_a_time(tmp_path, no_children):
 
 
 def test_tick_reaps_dead_runner_and_marks_missed(tmp_path, no_children):
-    p = _sp.Popen(["true"])
+    p = _sp.Popen([_sys.executable, "-c", "pass"])
     p.wait()
     a = SCH.add_job("every 30m", "a", str(tmp_path), now=MON_1300)
     SCH.update(a["id"], running={"pid": p.pid, "since": MON_1300, "log": "x"}, next_run=MON_1300 + 9 * 86400)
@@ -663,7 +666,8 @@ def test_execute_ok_writes_log_and_summary(tmp_path, monkeypatch, no_children):
     rc, j = _exec_job(tmp_path, monkeypatch, "import os; print('hello from', os.environ['FINCH_SCHEDULED_JOB'])")
     assert rc == 0 and j["last_status"] == "ok" and j["runs"] == 1 and j["running"] is None
     assert f"hello from {j['id']}" in j["last_summary"]
-    log = open(j["last_log"]).read()
+    with open(j["last_log"], encoding="utf-8") as f:
+        log = f.read()
     assert "# prompt:   say hi" in log and "· ok · exit 0" in log
     assert j["next_run"]                           # run-now of a future one-off keeps its slot
 
@@ -971,3 +975,288 @@ def test_missing_office_library_points_back_to_read_file():
     out = T.format_bash_out(1, "", "ModuleNotFoundError: No module named 'openpyxl'", False, True)
     assert "read_file(path)" in out
     assert "read_file(path)" not in T.format_bash_out(1, "", "ModuleNotFoundError: No module named 'numpy'", False, True)
+
+
+# ---------------- OS portability (osutil) ----------------
+from finch import osutil as OS
+
+
+def test_shell_command_per_shell():
+    assert OS.shell_command("ls -la", "/bin/bash") == (["/bin/bash", "-c", "ls -la"], False)
+    args, sh = OS.shell_command("dir", r"C:\Program Files\PowerShell\7\pwsh.exe")
+    assert args[-2] == "-Command" and args[-1].endswith("; dir") and "UTF8" in args[-1] and not sh
+    assert OS.shell_command("dir && echo x", r"C:\Windows\system32\cmd.exe") == ("chcp 65001 >nul & dir && echo x", True)
+    assert OS.shell_name(r"C:\Program Files\Git\bin\bash.exe") == "bash"
+    assert OS.shell_name(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe") == "powershell"
+
+
+def test_shell_override_and_hint(monkeypatch):
+    OS.shell_path.cache_clear()
+    monkeypatch.setenv("FINCH_SHELL", "/no/such/pwsh")
+    try:
+        assert OS.shell_path() == "/no/such/pwsh" and "PowerShell" in OS.shell_hint()
+    finally:
+        monkeypatch.delenv("FINCH_SHELL")
+        OS.shell_path.cache_clear()
+    assert OS.shell_name() in ("bash", "sh") or OS.IS_WIN
+
+
+def test_win_bash_never_picks_the_wsl_launcher(monkeypatch):
+    monkeypatch.setattr(OS.shutil, "which", lambda n: r"C:\Windows\System32\bash.exe" if n == "bash" else None)
+    for v in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(OS.os.path, "isfile", lambda p: True)
+    assert OS._win_bash() is None
+    monkeypatch.setenv("ProgramFiles", "PF")
+    assert OS._win_bash() == OS.os.path.join("PF", "Git", "bin", "bash.exe")
+
+
+def test_find_python_skips_store_stub(monkeypatch):
+    monkeypatch.setattr(OS, "IS_WIN", True)
+    stub = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe"
+    monkeypatch.setattr(OS.shutil, "which", lambda n: {"python": stub, "py": r"C:\Windows\py.exe"}.get(n))
+    assert OS.find_python() == r"C:\Windows\py.exe"
+    monkeypatch.setattr(OS.shutil, "which", lambda n: stub)
+    assert OS.find_python() == OS.sys.executable
+
+
+def test_split_cmd(tmp_path):
+    exe = tmp_path / "My Editor" / "ed.exe"
+    exe.parent.mkdir()
+    exe.write_text("")
+    assert OS.split_cmd(str(exe)) == [str(exe)]
+    assert OS.split_cmd("code --wait") == ["code", "--wait"]
+    assert OS.split_cmd("") == []
+
+
+def test_pid_alive_and_kill_tree():
+    import subprocess as sp
+    assert OS.pid_alive(os.getpid()) and not OS.pid_alive(0)
+    p = sp.Popen([_sys.executable, "-c", "import time; time.sleep(30)"], **OS.new_group())
+    assert OS.pid_alive(p.pid)
+    OS.kill_proc_tree(p)
+    p.wait(timeout=10)
+    assert not OS.pid_alive(p.pid)
+
+
+def test_lock_replace_decode(tmp_path):
+    with open(tmp_path / "l", "a+") as fh:
+        OS.lock(fh)
+        OS.unlock(fh)
+    (tmp_path / "a").write_text("new")
+    (tmp_path / "b").write_text("old")
+    OS.replace(str(tmp_path / "a"), str(tmp_path / "b"))
+    assert (tmp_path / "b").read_text() == "new"
+    assert OS.decode("✓".encode()) == "✓" and OS.decode(b"\xe9") and OS.decode(b"") == ""
+
+
+def test_run_bash_timeout_kills_tree(tmp_path):
+    tb = box(tmp_path, bash_timeout=2)
+    out = tb.run("run_bash", {"command": "sleep 30 & sleep 30; echo never"})
+    assert "timed out" in out and "never" not in out
+
+
+def test_daemon_stops_on_stop_file(tmp_path, no_children):
+    out = []
+    t = threading.Thread(target=SCH.daemon, kwargs={"out": out.append})
+    t.start()
+    for _ in range(50):
+        if SCH.daemon_pid():
+            break
+        threading.Event().wait(0.1)
+    open(SCH.stop_file(), "w").close()
+    t.join(timeout=5)
+    assert not t.is_alive() and not os.path.exists(SCH.pid_file()) and not os.path.exists(SCH.stop_file())
+
+
+# ---------------- tool & skill toggles ----------------
+class ToolsSeenLLM(FakeLLM):
+    def chat(self, model, messages, tools=None, **kw):
+        if tools:
+            self.seen = [t["function"]["name"] for t in tools]
+        return super().chat(model, messages, tools=tools, **kw)
+
+
+def surface(a, qa=False, cats=("file", "code", "web")):
+    return [d["function"]["name"] for d in a.tool_surface(qa, list(cats), set(), set())]
+
+
+def test_tool_off_leaves_every_surface(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    a.s.set_tool("run_bash", False)
+    a.s.set_tool("read_file", False)
+    assert "run_bash" not in surface(a) and "read_file" not in surface(a)
+    assert "read_file" not in surface(a, qa=True) and "list_dir" in surface(a, qa=True)
+    a.s.set_trick("flat_prefill", False)
+    assert "run_bash" not in surface(a) and "run_python" in surface(a)
+
+
+def test_finish_is_locked_on(tmp_path):
+    s = settings()
+    s.set_tool("finish", False)
+    assert s.tool_on("finish") and "finish" not in s.tools_off
+
+
+def test_tool_off_refused_everywhere(tmp_path):
+    tb = box(tmp_path)
+    tb.s.set_tool("run_bash", False)
+    assert "turned off" in tb.run("run_bash", {"command": "echo hi"})
+    assert "turned off" in tb.run("bash", {"command": "echo hi"})            # alias
+    out = tb.run("batch_tools", {"calls": [{"tool": "run_bash", "args": {"command": "echo hi"}}]})
+    assert "turned off" in out and "hi\n" not in out
+    tb.s.set_tool("mcp:fs", False)
+    assert tb.s.tool_on("other.read") and not tb.s.tool_on("fs.read")
+    tb.mcp = object()
+    assert "turned off" in tb.run("mcp_call", {"server": "fs", "tool": "read"})
+
+
+def test_tool_off_not_auto_enabled_or_unlocked(tmp_path):
+    a, llm = make_agent(tmp_path, [
+        ("enable_tools", {"tools": ["run_python"]}),
+        ("run_python", {"code": "open('x.txt','w').write('1')"}),
+        ("create_file", {"path": "out.txt", "content": "ok"}),
+        ("finish", {"summary": "wrote out.txt"}),
+        ("finish", {"summary": "wrote out.txt"}),
+    ])
+    a.s.set_tool("run_python", False)
+    a.run_turn("write ok into out.txt")
+    tool_msgs = [m["content"] for m in llm.calls[-1] if m["role"] == "tool"]
+    assert any("run_python (turned off by the user)" in m for m in tool_msgs)
+    assert any(m.startswith("[run_python is turned off") for m in tool_msgs)
+    assert not (tmp_path / "x.txt").exists() and (tmp_path / "out.txt").exists()
+
+
+def test_enable_tools_description_tracks_toggles(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    desc = lambda: next(d["function"]["description"] for d in a.tool_surface(False, ["file"], set(), set())
+                        if d["function"]["name"] == "enable_tools")
+    assert desc() == T.ALL_BUILTIN["enable_tools"]["function"]["description"]
+    a.s.set_tool("web_search", False)
+    assert "web_search" not in desc() and "web_fetch" in desc()
+
+
+@pytest.fixture
+def skills_home():
+    return config.SKILLS_DIR_HOME
+
+
+def test_skill_off_hidden_and_not_loadable(tmp_path, skills_home):
+    with open(os.path.join(skills_home, "mine.md"), "w", encoding="utf-8") as f:
+        f.write("---\ndescription: my skill\n---\nbody")
+    tb = box(tmp_path)
+    infos = {i["name"]: i for i in T.skill_infos(str(tmp_path))}
+    assert infos["mine"]["scope"] == "user" and infos["bug_fix"]["scope"] == "built-in"
+    tb.s.set_skill("bug_fix", False)
+    listing = tb.run("skills", {"action": "list"})
+    assert "mine: my skill" in listing and "bug_fix" not in listing
+    assert "turned off" in tb.run("skills", {"action": "load", "name": "bug_fix"})
+    assert tb.run("skills", {"action": "load", "name": "mine"}).startswith("### SKILL: mine")
+
+
+def test_all_skills_off_drops_skills_tool(tmp_path, skills_home):
+    a, _ = make_agent(tmp_path, [])
+    assert "skills" in surface(a)
+    for i in T.skill_infos(str(tmp_path)):
+        a.s.set_skill(i["name"], False)
+    assert "skills" not in surface(a)
+
+
+def test_tool_and_skill_toggles_persist(tmp_path):
+    s = settings()
+    s.set_tool("web_fetch", False)
+    s.set_skill("code_review", False)
+    config.save_settings(s)
+    s2 = config.load_settings()
+    assert not s2.tool_on("web_fetch") and not s2.skill_on("code_review") and s2.tool_on("run_bash")
+
+
+def test_settings_tools_and_skills_tabs(tmp_path, skills_home):
+    from types import SimpleNamespace
+    from finch import settings_menu as SM
+    s = settings()
+    app = SimpleNamespace(s=s, tb=box(tmp_path), backend=SimpleNamespace(list_models=lambda: []),
+                          mcp=SimpleNamespace(config=lambda: {"fs": {"command": "npx", "args": ["-y", "x"]}}))
+    m = SM.SettingsMenu(app)
+    m.tab = SM.TOOLS
+    keys = {it.key: it for it in m.items()}
+    assert set(T.ALL_BUILTIN) | {"mcp:fs"} <= set(keys) and keys["finish"].kind == "locked"
+    keys["run_bash"].set(False)
+    keys["mcp:fs"].set(False)
+    assert not s.tool_on("run_bash") and not s.tool_on("fs.anything")
+    m._all_tools(True)
+    assert s.tools_off == []
+    m._all_tools(False)
+    assert s.tool_on("finish") and not s.tool_on("todo")
+    "".join(t for _, t in m.render())
+    m.tab = SM.SKILLS
+    skill = next(it for it in m.items() if it.key == "bug_fix")
+    skill.set(False)
+    assert not s.skill_on("bug_fix")
+    assert "Skills" in "".join(t for _, t in m.render())
+    m.tab = SM.GENERAL
+    nav = {it.key: it.get() for it in m.items() if it.kind == "nav"}
+    assert nav["_nav_tools"] == f"0/{len(T.ALL_BUILTIN)} on" and nav["_nav_skills"].startswith("5/")
+
+
+# ---------------- settings profiles ----------------
+def test_profile_save_load_roundtrip(tmp_path):
+    s = settings(model="big:35b", num_ctx=65536, theme="hermes", soul="pirate", think=False)
+    s.set_trick("self_check", False)
+    s.set_tool("run_bash", False)
+    path = config.save_profile(s, "work")
+    assert path.startswith(config.PROFILES_DIR) and [p["name"] for p in config.list_profiles()] == ["work"]
+    s2 = settings(model="small:4b")
+    s2.host = "http://other:11434"
+    assert "model" in config.profile_diff(s2, config.load_profile("work"))
+    config.apply_profile(s2, config.load_profile("work"))
+    assert (s2.model, s2.num_ctx, s2.theme, s2.soul, s2.think) == ("big:35b", 65536, "hermes", "pirate", False)
+    assert not s2.on("self_check") and not s2.tool_on("run_bash")
+    assert config.profile_diff(s2, config.load_profile("work")) == []
+    s2.set_tool("run_bash", True)                    # applied values are copies, not shared with the profile
+    assert not config.load_profile("work")["tools_off"] == s2.tools_off
+
+
+def test_profile_partial_and_unknown_keys(tmp_path):
+    os.makedirs(config.PROFILES_DIR, exist_ok=True)
+    with open(config.profile_path("old"), "w", encoding="utf-8") as f:
+        f.write('{"model": "m:1b", "unsafe_thing": 1, "unattended": true}')
+    s = settings(num_ctx=8192)
+    config.apply_profile(s, config.load_profile("old"))
+    assert s.model == "m:1b" and s.num_ctx == 8192 and not hasattr(s, "unsafe_thing")
+
+
+def test_profile_list_order_insensitive_diff(tmp_path):
+    s = settings()
+    s.tools_off = ["a", "b"]
+    assert config.profile_diff(s, {"tools_off": ["b", "a"]}) == []
+
+
+@pytest.mark.parametrize("name", ["", "../x", "a/b", "con", "NUL.txt", "x" * 60, ".hidden"])
+def test_profile_bad_names(name):
+    with pytest.raises(ValueError):
+        config.save_profile(settings(), name)
+
+
+def test_profile_missing_and_delete(tmp_path):
+    with pytest.raises(ValueError, match="no profile"):
+        config.load_profile("nope")
+    config.save_profile(settings(), "tmp")
+    assert config.delete_profile("tmp") and not config.delete_profile("tmp")
+
+
+def test_settings_profiles_tab(tmp_path):
+    from types import SimpleNamespace
+    from finch import settings_menu as SM
+    s = settings(model="a:1b")
+    config.save_profile(s, "one")
+    app = SimpleNamespace(s=s, tb=box(tmp_path), backend=SimpleNamespace(list_models=lambda: []),
+                          mcp=SimpleNamespace(config=lambda: {}))
+    m = SM.SettingsMenu(app)
+    m.tab = SM.PROFILES
+    items = {it.key: it for it in m.items()}
+    assert items["one"].kind == "profile" and "Matches" in items["one"].desc
+    assert "current" in "".join(t for _, t in m.render())
+    s.model = "b:2b"
+    assert "model" in next(it for it in m.items() if it.key == "one").desc
+    m.tab = SM.GENERAL
+    assert next(it for it in m.items() if it.key == "_nav_prof").get() == "1 saved"

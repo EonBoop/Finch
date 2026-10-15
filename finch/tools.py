@@ -11,12 +11,11 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
 
-from . import config, docs
+from . import config, docs, osutil
 from .safety import safe_path
 
 
@@ -29,6 +28,10 @@ def _f(name, desc, props, req=None):
 
 S, B, N = {"type": "string"}, {"type": "boolean"}, {"type": "number"}
 ARR = {"type": "array", "items": {"type": "string"}}
+
+ENABLE_TOOLS_DESC = "Enable advanced tools on demand: "
+ENABLE_LISTED = ("run_python", "append_file", "delete_file", "search_files", "web_search", "web_fetch",
+                 "memory_store", "memory_recall", "mcp_call")
 
 CORE_TOOLS = [
     _f("create_file", "Create or overwrite a file. Overwriting an existing larger file requires replace=true",
@@ -43,8 +46,7 @@ CORE_TOOLS = [
         "index": N, "done": B, "all": B}, ["action"]),
     _f("skills", "List available skills, or load one by name to follow its instructions",
        {"action": {"type": "string", "enum": ["list", "load"]}, "name": S}, ["action"]),
-    _f("enable_tools", "Enable advanced tools on demand: run_python, append_file, delete_file, "
-       "search_files, web_search, web_fetch, memory_store, memory_recall, mcp_call", {"tools": ARR}),
+    _f("enable_tools", ENABLE_TOOLS_DESC + ", ".join(ENABLE_LISTED), {"tools": ARR}),
     _f("finish", "Declare the task complete with a short summary", {"summary": S}),
 ]
 ADVANCED_TOOLS = [
@@ -77,6 +79,23 @@ REQ_ARGS = {"create_file": ["path", "content"], "read_file": ["path"], "edit_fil
             "append_file": ["path", "content"], "delete_file": ["path"], "todo": ["action"],
             "skills": ["action"], "finish": ["summary"], "search_files": ["path", "pattern"],
             "web_search": ["query"], "web_fetch": ["url"]}
+
+
+
+def off_msg(name):
+    return (f"[{name} is turned off by the user in /settings and cannot be used. Do the work with the tools "
+            f"you have, or tell the user what you would need.]")
+
+
+def enable_tools_def(settings):
+    """enable_tools advertising only the advanced tools that are switched on."""
+    allowed = [n for n in ENABLE_LISTED if settings.tool_on(n)]
+    if len(allowed) == len(ENABLE_LISTED):
+        return ALL_BUILTIN["enable_tools"]
+    d = copy.deepcopy(ALL_BUILTIN["enable_tools"])
+    d["function"]["description"] = ENABLE_TOOLS_DESC + (", ".join(allowed) or "(none: all turned off)")
+    return d
+
 
 # Small models emit industry-standard names; map instead of refusing ("tool disabled"
 # sends a small model into a retry loop).
@@ -125,12 +144,7 @@ def read_text(path):
 
 
 def decode_console(raw):
-    if not raw:
-        return ""
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1", "replace")
+    return osutil.decode(raw)
 
 
 def auto_repair(path):
@@ -189,12 +203,12 @@ def format_bash_out(rc, out, err, small=False, hints=True):
         res += ("\n[hint: that library isn't installed and you don't need it: read_file(path) already returns the "
                 "text of .xlsx/.docx/.pptx/.pdf files (spreadsheets as numbered rows). Use it, or process the "
                 "text it gives you.]")
-    elif rc == 127 and ("not found" in err or not (out.strip() or err.strip())):
+    elif (rc == 127 and ("not found" in err or not (out.strip() or err.strip()))) or "is not recognized as" in err:
         res += ("\n[hint: exit 127 = command not found on this machine. Python tools that aren't on PATH "
-                "usually work as modules: python3 -m pytest / python3 -m pip. Use python3, not python.]")
+                f"usually work as modules: {osutil.PY} -m pytest / {osutil.PY} -m pip. Use {osutil.PY}.]")
     if hints and "load_setuptools_entrypoints" in err + out:
         res += ("\n[hint: pytest crashed while auto-loading a broken third-party plugin: an environment "
-                "problem, not your code. Re-run as: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q]")
+                f"problem, not your code. Re-run with PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 set: {osutil.PY} -m pytest -q]")
     if small and (len(out) > 2500 or len(err) > 1200):
         res = (f"[exit {rc}]\nSTDOUT (tail):\n{out[-2500:]}\nSTDERR (tail):\n{err[-1200:]}"
                "\n[output trimmed to the tail for a small model. For the full output: "
@@ -203,34 +217,24 @@ def format_bash_out(rc, out, err, small=False, hints=True):
 
 
 def _run_proc(cmd, cwd, timeout, shell=True, env=None):
-    env = dict(env or os.environ)
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    env["PAGER"] = "cat"
-    env["GIT_PAGER"] = "cat"
-    proc = subprocess.Popen(cmd, shell=shell, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            executable="/bin/bash" if shell and os.name != "nt" else None,
-                            start_new_session=(os.name != "nt"))
+    """shell=True runs cmd (a string) in the platform shell (osutil.shell_path); else cmd is argv."""
+    env = osutil.child_env(env, PAGER="cat", GIT_PAGER="cat")
+    args, use_shell = osutil.shell_command(cmd) if shell else (cmd, False)
+    proc = subprocess.Popen(args, shell=use_shell, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **osutil.hidden_group())
     try:
         ob, eb = proc.communicate(timeout=timeout)
         return proc.returncode, decode_console(ob), decode_console(eb), False
     except subprocess.TimeoutExpired:
-        # killing only the shell leaves grandchildren holding the pipe: kill the group
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            proc.kill()
+        # killing only the shell leaves grandchildren holding the pipe: kill the tree
+        osutil.kill_proc_tree(proc)
         try:
             ob, eb = proc.communicate(timeout=10)
         except Exception:
             ob, eb = b"", b""
         return proc.returncode or 1, decode_console(ob), decode_console(eb), True
     except KeyboardInterrupt:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            proc.kill()
+        osutil.kill_proc_tree(proc)
         raise
 
 
@@ -310,12 +314,13 @@ def bash_snapshot(cmd, workdir, rollback):
         return []
     out = []
     wd = os.path.realpath(workdir)
-    for tok in re.findall(r"[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,8}", cmd):
+    for tok in re.findall(r"[A-Za-z0-9_\-./\\:]+\.[A-Za-z0-9]{1,8}", cmd):
         base = os.path.basename(tok)
         if base.endswith(".bak") or base.startswith("."):
             continue
         rp = os.path.realpath(os.path.join(workdir, tok))
-        if not rp.startswith(wd + os.sep) or not os.path.isfile(rp) or "/.finch/" in rp:
+        inside = os.path.normcase(rp).startswith(os.path.normcase(wd) + os.sep)
+        if not inside or not os.path.isfile(rp) or f"{os.sep}.finch{os.sep}" in rp:
             continue
         try:
             rollback.backup(rp)
@@ -384,7 +389,8 @@ PKG_SKILLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
 
 def _skill_bases(workdir):
-    return [os.path.join(workdir, ".finch", "skills"), config.SKILLS_DIR_HOME, PKG_SKILLS]
+    return [(os.path.join(workdir, ".finch", "skills"), "project"), (config.SKILLS_DIR_HOME, "user"),
+            (PKG_SKILLS, "built-in")]
 
 
 def _skill_desc(path):
@@ -402,25 +408,31 @@ def _skill_desc(path):
     return ""
 
 
-def list_skills(workdir):
+def skill_infos(workdir):
+    """Every skill by name (project > user > built-in): [{name, desc, scope, path}]."""
     seen = {}
-    for base in _skill_bases(workdir):
+    for base, scope in _skill_bases(workdir):
         if os.path.isdir(base):
             for f in sorted(os.listdir(base)):
-                if f.endswith((".md", ".txt")):
-                    seen.setdefault(f.rsplit(".", 1)[0], _skill_desc(os.path.join(base, f)))
-    if not seen:
-        return "(none)"
-    return "\n".join(f"- {n}: {d}" if d else f"- {n}" for n, d in sorted(seen.items()))
+                n = f.rsplit(".", 1)[0]
+                if f.endswith((".md", ".txt")) and n not in seen:
+                    p = os.path.join(base, f)
+                    seen[n] = {"name": n, "desc": _skill_desc(p), "scope": scope, "path": p}
+    return [seen[n] for n in sorted(seen)]
 
 
-def load_skill(name, workdir):
-    for base in _skill_bases(workdir):
-        for ext in (".md", ".txt"):
-            p = os.path.join(base, str(name) + ext)
-            if os.path.exists(p):
-                return f"### SKILL: {name}\n{read_text(p)}"
-    return f"[skill '{name}' not found. Available:\n{list_skills(workdir)}]"
+def list_skills(workdir, off=()):
+    lines = [f"- {i['name']}: {i['desc']}" if i["desc"] else f"- {i['name']}"
+             for i in skill_infos(workdir) if i["name"] not in off]
+    return "\n".join(lines) or "(none)"
+
+
+def load_skill(name, workdir, off=()):
+    info = next((i for i in skill_infos(workdir) if i["name"] == str(name)), None)
+    if info and info["name"] not in off:
+        return f"### SKILL: {name}\n{read_text(info['path'])}"
+    why = "is turned off in /settings" if info else "not found"
+    return f"[skill '{name}' {why}. Available:\n{list_skills(workdir, off)}]"
 
 
 # ---- web ----
@@ -569,6 +581,8 @@ class ToolBox:
         if self.s.on("aliases"):
             name = ALIASES.get(name, name)
             args = normalize_args(name, args)
+        if not self.s.tool_on(name):
+            return off_msg(name)
         try:
             if "." in name and self.mcp and self.mcp.is_tool(name):
                 gate = self.gate.check(name, args, self.workdir)
@@ -685,7 +699,7 @@ class ToolBox:
                 note = (f"[crawl-guard: '{path}' has served {st[1]} chars, over this file's budget of {budget} "
                         f"({CRAWL_MULT}x file size). Reads still work but return at most {CRAWL_THROTTLE} chars "
                         f"each. To process this file efficiently, run one python script that does the "
-                        f"counting/searching/aggregation, e.g.\n  python3 -c \"import collections; "
+                        f"counting/searching/aggregation, e.g.\n  {osutil.PY} -c \"import collections; "
                         f"ls=open('{path}').readlines(); print(len(ls))\"\n]")
             else:
                 note = f"[crawl-guard: '{path}' throttled ({CRAWL_THROTTLE} chars/read). A script gets it all at once.]"
@@ -906,8 +920,8 @@ class ToolBox:
 
     def t_skills(self, a):
         if a.get("action", "list") == "list" or not a.get("name"):
-            return list_skills(self.workdir)
-        return load_skill(a["name"], self.workdir)
+            return list_skills(self.workdir, self.s.skills_off)
+        return load_skill(a["name"], self.workdir, self.s.skills_off)
 
     def t_finish(self, a):
         return "[TASK_COMPLETE] " + str(a.get("summary", ""))
@@ -958,6 +972,8 @@ class ToolBox:
     def t_mcp_call(self, a):
         if not self.mcp:
             return "[mcp_call: no MCP servers configured (~/.finch/mcp.json)]"
+        if not self.s.tool_on(f"{a['server']}.{a['tool']}"):
+            return off_msg(f"MCP server {a['server']}")
         return self.mcp.call(str(a["server"]), str(a["tool"]), a.get("args") or {}, self.workdir)
 
     def t_enable_tools(self, a):

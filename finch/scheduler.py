@@ -27,7 +27,6 @@ Scheduled runs are unattended: risky actions are denied unless the job has auto-
 import calendar
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import os
 import re
@@ -37,7 +36,7 @@ import subprocess
 import sys
 import time
 
-from . import config
+from . import config, osutil
 
 TICK = 15                       # seconds between runner checks
 ONCE_GRACE = 24 * 3600          # a one-off job later than this is marked missed
@@ -69,6 +68,10 @@ def pid_file():
 
 def daemon_log():
     return os.path.join(home(), "daemon.log")
+
+
+def stop_file():
+    return os.path.join(home(), "daemon.stop")
 
 
 def busy_dir():
@@ -509,12 +512,17 @@ def upcoming(job, n=3, now=None):
 
 # ---------------- store ----------------
 def _read():
-    try:
-        with open(jobs_file(), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (FileNotFoundError, ValueError):
-        return []
+    for attempt in range(40):
+        try:
+            with open(jobs_file(), encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (FileNotFoundError, ValueError):
+            return []
+        except PermissionError:     # Windows: a writer is mid-replace
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 @contextlib.contextmanager
@@ -522,13 +530,13 @@ def _locked():
     """Exclusive read-modify-write of jobs.json across processes. Saved only if the block succeeds."""
     os.makedirs(home(), exist_ok=True)
     with open(os.path.join(home(), ".lock"), "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        osutil.lock(fh)
         try:
             jobs = _read()
             yield jobs
             config.atomic_write_json(jobs_file(), jobs)
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            osutil.unlock(fh)
 
 
 def load_jobs():
@@ -637,19 +645,7 @@ def request_run(ref):
 
 # ---------------- process helpers ----------------
 def _alive(pid):
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            return f.read().split(")")[-1].split()[0] != "Z"     # zombies are dead
-    except OSError:
-        return True
+    return osutil.pid_alive(pid)
 
 
 @contextlib.contextmanager
@@ -658,7 +654,7 @@ def busy():
     os.makedirs(busy_dir(), exist_ok=True)
     p = os.path.join(busy_dir(), str(os.getpid()))
     try:
-        open(p, "w").close()
+        open(p, "w", encoding="utf-8").close()
     except OSError:
         p = None
     try:
@@ -686,7 +682,8 @@ def someone_busy():
 
 def daemon_pid():
     try:
-        pid = int(open(pid_file()).read().strip())
+        with open(pid_file(), encoding="utf-8") as f:
+            pid = int(f.read().strip())
     except (OSError, ValueError):
         return None
     return pid if _alive(pid) else None
@@ -743,10 +740,10 @@ def job_command(job):
 
 
 def _launch(job):
-    env = dict(os.environ, FINCH_HOME=config.FINCH_HOME)
+    env = osutil.child_env(FINCH_HOME=config.FINCH_HOME)
     return subprocess.Popen([sys.executable, "-I", "-m", "finch", "schedule", "exec", job["id"]],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True, env=env, cwd=home())
+                            env=env, cwd=home(), **osutil.detached())
 
 
 def tick(now=None, launcher=None):
@@ -812,17 +809,16 @@ def execute(jid):
         if not os.path.isdir(j["workdir"]):
             out.write(f"[scheduler] working directory no longer exists: {j['workdir']}\n")
         else:
-            env = dict(os.environ, FINCH_SCHEDULED_JOB=j["id"], COLUMNS="100", TERM="dumb", NO_COLOR="1")
+            env = osutil.child_env(FINCH_SCHEDULED_JOB=j["id"], COLUMNS="100", TERM="dumb", NO_COLOR="1")
             p = subprocess.Popen(job_command(j), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                 cwd=j["workdir"], env=env, start_new_session=True)
+                                 cwd=j["workdir"], env=env, **osutil.hidden_group())
             try:
                 rc = p.wait(timeout=j.get("timeout") or DEFAULT_TIMEOUT)
                 status = "ok" if rc == 0 else "failed"
             except subprocess.TimeoutExpired:
                 status = "timeout"
-                for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(p.pid, sig)
+                for force, wait in ((False, 10), (True, 5)):
+                    osutil.kill_tree(p.pid, force=force)
                     try:
                         rc = p.wait(timeout=wait)
                         break
@@ -869,7 +865,9 @@ def daemon(out=print, stop=None):
     if other and other != os.getpid():
         out(f"a scheduler daemon is already running (pid {other})")
         return 1
-    with open(pid_file(), "w") as f:
+    with contextlib.suppress(OSError):
+        os.remove(stop_file())
+    with open(pid_file(), "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
     flag = {"stop": False}
 
@@ -877,9 +875,14 @@ def daemon(out=print, stop=None):
         flag["stop"] = True
     with contextlib.suppress(ValueError):
         signal.signal(signal.SIGTERM, _term)
+
+    def stopping():
+        if os.path.exists(stop_file()):     # stop_daemon's request; the only one Windows can deliver
+            flag["stop"] = True
+        return flag["stop"] or (stop and stop.is_set())
     out(f"[{_dt(time.time()):%Y-%m-%d %H:%M:%S}] finch scheduler daemon started (pid {os.getpid()})")
     try:
-        while not flag["stop"] and not (stop and stop.is_set()):
+        while not stopping():
             try:
                 j = tick()
                 if j:
@@ -887,7 +890,7 @@ def daemon(out=print, stop=None):
             except Exception as e:     # keep the daemon alive through a bad job file etc.
                 out(f"[{_dt(time.time()):%Y-%m-%d %H:%M:%S}] tick error: {e}")
             for _ in range(TICK * 2):
-                if flag["stop"] or (stop and stop.is_set()):
+                if stopping():
                     break
                 time.sleep(0.5)
                 _poll_children()
@@ -895,8 +898,11 @@ def daemon(out=print, stop=None):
         pass
     finally:
         with contextlib.suppress(OSError):
-            if open(pid_file()).read().strip() == str(os.getpid()):
+            with open(pid_file(), encoding="utf-8") as f:
+                mine = f.read().strip() == str(os.getpid())
+            if mine:
                 os.remove(pid_file())
+                os.remove(stop_file())
         out(f"[{_dt(time.time()):%Y-%m-%d %H:%M:%S}] daemon stopped")
     return 0
 
@@ -906,10 +912,10 @@ def start_daemon():
     if pid:
         return pid, f"daemon already running (pid {pid})"
     os.makedirs(home(), exist_ok=True)
-    env = dict(os.environ, FINCH_HOME=config.FINCH_HOME)
-    with open(daemon_log(), "a") as lf:
+    env = osutil.child_env(FINCH_HOME=config.FINCH_HOME)
+    with open(daemon_log(), "a", encoding="utf-8") as lf:
         subprocess.Popen([sys.executable, "-I", "-m", "finch", "schedule", "daemon"], stdin=subprocess.DEVNULL,
-                         stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=env, cwd=home())
+                         stdout=lf, stderr=subprocess.STDOUT, env=env, cwd=home(), **osutil.detached())
     for _ in range(40):
         time.sleep(0.1)
         pid = daemon_pid()
@@ -922,11 +928,16 @@ def stop_daemon():
     pid = daemon_pid()
     if not pid:
         return "daemon is not running"
-    os.kill(pid, signal.SIGTERM)
+    with open(stop_file(), "w", encoding="utf-8"):
+        pass
+    if not osutil.IS_WIN:
+        osutil.terminate(pid)
     for _ in range(40):
         time.sleep(0.1)
         if not _alive(pid):
             break
+    else:
+        osutil.terminate(pid)
     return f"daemon stopped (pid {pid}); a job that was already running finishes on its own"
 
 

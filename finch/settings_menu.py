@@ -1,6 +1,6 @@
 """/settings: an inline, keyboard-driven settings menu (prompt_toolkit Application).
 
-Tabs: General · Tricks · Theme · Soul · Schedule.  ↑/↓ move · ←/→ change · space/enter toggle or edit ·
+Tabs: General · Tricks · Tools · Skills · Theme · Soul · Schedule · Profiles.  ↑/↓ move · ←/→ change · space/enter toggle or edit ·
 tab switch tabs · esc/q save & close. Changes apply live and are persisted on close."""
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -12,14 +12,16 @@ from prompt_toolkit.styles import Style
 import os
 import subprocess
 
-from . import config, scheduler as SCH, souls, themes, tricks as TR
+from . import config, osutil, scheduler as SCH, souls, themes, tools as T, tricks as TR
 
-TABS = ("General", "Tricks", "Theme", "Soul", "Schedule")
+TABS = ("General", "Tricks", "Tools", "Skills", "Theme", "Soul", "Schedule", "Profiles")
+GENERAL, TRICKS, TOOLS, SKILLS, THEME, SOUL, SCHEDULE, PROFILES = range(len(TABS))
+BACK_DESC = "Return to the General tab (or backspace / 1)."
 
 
 class Item:
     def __init__(self, key, label, kind, get, set=None, options=None, desc="", fmt=None, group=None, target=None):
-        self.key, self.label, self.kind = key, label, kind      # kind: bool|choice|int|action|nav|theme|header
+        self.key, self.label, self.kind = key, label, kind      # kind: bool|choice|int|action|nav|theme|header|locked|profile
         self.target = target                                     # nav: tab index to open
         self.get, self.set = get, set
         self.options = options or []
@@ -47,6 +49,7 @@ class SettingsMenu:
         self.edit_request = None
         self.soul_request = None
         self.sched_request = None
+        self.prof_request = None
         self.flash = ""
         try:
             self.models = app.backend.list_models()
@@ -62,15 +65,24 @@ class SettingsMenu:
             app.set_model(v, quiet=True)
 
         n_on = sum(1 for k in TR.KEYS if s.on(k))
+        tools, skills = self._tool_keys(), self._skill_names()
+        n_tools = sum(1 for k in tools if k not in s.tools_off)
+        n_skills = sum(1 for n in skills if s.skill_on(n))
         return [
-            Item("_nav_tricks", "Harness tricks", "nav", lambda: f"{n_on}/{len(TR.KEYS)} on", target=1,
+            Item("_nav_tricks", "Harness tricks", "nav", lambda: f"{n_on}/{len(TR.KEYS)} on", target=TRICKS,
                  desc="Turn Mingbird's small-model mechanisms on or off individually. Enter to open (or press 2)."),
-            Item("_nav_theme", "Theme", "nav", lambda: s.theme, target=2,
-                 desc="Pick a colour theme with live preview. Enter to open (or press 3)."),
-            Item("_nav_soul", "Soul", "nav", lambda: s.soul or "none", target=3,
-                 desc="Switch the SOUL.md persona injected into every system prompt. Enter to open (or press 4)."),
-            Item("_nav_sched", "Scheduled jobs", "nav", self._sched_summary, target=4,
-                 desc="One-off and recurring jobs Finch runs on its own. Enter to open (or press 5)."),
+            Item("_nav_tools", "Tools", "nav", lambda: f"{n_tools}/{len(tools)} on", target=TOOLS,
+                 desc="Choose which tools the model may use (built-in and MCP servers). Enter to open (or press 3)."),
+            Item("_nav_skills", "Skills", "nav", lambda: f"{n_skills}/{len(skills)} on", target=SKILLS,
+                 desc="Choose which skills the model can list and load. Enter to open (or press 4)."),
+            Item("_nav_theme", "Theme", "nav", lambda: s.theme, target=THEME,
+                 desc="Pick a colour theme with live preview. Enter to open (or press 5)."),
+            Item("_nav_soul", "Soul", "nav", lambda: s.soul or "none", target=SOUL,
+                 desc="Switch the SOUL.md persona injected into every system prompt. Enter to open (or press 6)."),
+            Item("_nav_sched", "Scheduled jobs", "nav", self._sched_summary, target=SCHEDULE,
+                 desc="One-off and recurring jobs Finch runs on its own. Enter to open (or press 7)."),
+            Item("_nav_prof", "Profiles", "nav", self._prof_summary, target=PROFILES,
+                 desc="Save all these settings under a name and switch between them. Enter to open (or press 8)."),
             Item("_h_general", "General", "header", lambda: None),
             Item("model", "Model", "choice", lambda: s.model, set_model, self.models,
                  "Model used for new turns. ←/→ to cycle through installed models."),
@@ -114,7 +126,7 @@ class SettingsMenu:
     def trick_items(self):
         s = self.s
         out = [
-            Item("_back", "‹ Back to General", "nav", lambda: "", target=0, desc="Return to the General tab (or backspace / 1)."),
+            Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC),
             Item("_all_on", "Enable all tricks", "action", lambda: None, lambda v: self._all(True),
                  desc="The full Mingbird harness (default)."),
             Item("_all_off", "Disable all tricks (raw model)", "action", lambda: None, lambda v: self._all(False),
@@ -128,9 +140,76 @@ class SettingsMenu:
                                     (lambda v, k=key: s.set_trick(k, v)), desc=desc, group=g))
         return out
 
+    def _mcp_servers(self):
+        try:
+            return list(self.app.mcp.config()) if getattr(self.app, "mcp", None) else []
+        except Exception:
+            return []
+
+    def _tool_keys(self):
+        """Switchable tools: built-in names (minus the locked ones) and "mcp:<server>"."""
+        return ([n for n in T.ALL_BUILTIN if n not in config.LOCKED_TOOLS]
+                + ["mcp:" + srv for srv in self._mcp_servers()])
+
+    def _skill_names(self):
+        return [i["name"] for i in T.skill_infos(self.app.tb.workdir)]
+
+    def tool_items(self):
+        s = self.s
+
+        def tool(name, label=None, desc=None):
+            return Item(name, label or name, "bool", lambda: s.tool_on(name), lambda v: s.set_tool(name, v),
+                        desc=desc or T.ALL_BUILTIN[name]["function"]["description"])
+        out = [Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC),
+               Item("_all_on", "Enable all tools", "action", lambda: None, lambda v: self._all_tools(True),
+                    desc="Every tool available again (default)."),
+               Item("_all_off", "Disable all tools", "action", lambda: None, lambda v: self._all_tools(False),
+                    desc="The model can only answer in text and call finish. Useful to test a model's raw replies."),
+               Item("_h_core", "Core (always offered on tasks)", "header", lambda: None)]
+        for d in T.CORE_TOOLS:
+            n = d["function"]["name"]
+            if n in config.LOCKED_TOOLS:
+                out.append(Item(n, n, "locked", lambda: True,
+                                desc=d["function"]["description"] + ". Always on: the finish gates depend on it."))
+            else:
+                out.append(tool(n))
+        out.append(Item("_h_adv", "On demand (category routing / enable_tools)", "header", lambda: None))
+        out += [tool(d["function"]["name"]) for d in T.ADVANCED_TOOLS]
+        servers = self._mcp_servers()
+        out.append(Item("_h_mcp", "MCP servers" if servers else f"MCP servers: none configured ({config.MCP_CONFIG})",
+                        "header", lambda: None))
+        cfg = self.app.mcp.config() if servers else {}
+        for srv in servers:
+            c = cfg.get(srv) or {}
+            cmd = " ".join([str(c.get("command", c.get("url", "")))] + [str(x) for x in c.get("args", [])])
+            out.append(tool("mcp:" + srv, srv, f"All tools of the MCP server '{srv}' ({cmd[:100]})."))
+        return out
+
+    def skill_items(self):
+        s = self.s
+        out = [Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC),
+               Item("_all_on", "Enable all skills", "action", lambda: None, lambda v: self._all_skills(True),
+                    desc="Every skill can be listed and loaded (default)."),
+               Item("_all_off", "Disable all skills", "action", lambda: None, lambda v: self._all_skills(False),
+                    desc="The skills tool is dropped from the prompt entirely (a smaller prompt).")]
+        infos = T.skill_infos(self.app.tb.workdir)
+        if not infos:
+            out.append(Item("_h_none", f"No skills found (add .md files to {config.SKILLS_DIR_HOME})", "header",
+                            lambda: None))
+        heads = {"project": "Project (.finch/skills)", "user": f"User ({config.SKILLS_DIR_HOME})",
+                 "built-in": "Built-in"}
+        for scope, head in heads.items():
+            group = [i for i in infos if i["scope"] == scope]
+            if group:
+                out.append(Item("_h_" + scope, head, "header", lambda: None))
+            for i in group:
+                out.append(Item(i["name"], i["name"], "bool", (lambda n=i["name"]: s.skill_on(n)),
+                                (lambda v, n=i["name"]: s.set_skill(n, v)),
+                                desc=f"{i['desc'] or '(no description)'}  ·  {i['path']}"))
+        return out
+
     def theme_items(self):
-        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=0,
-                    desc="Return to the General tab (or backspace / 1).")
+        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC)
         out = [back]
         for grp, names in themes.GROUPS.items():
             out.append(Item("_h_" + grp, grp, "header", lambda: None))
@@ -142,8 +221,7 @@ class SettingsMenu:
     def soul_items(self):
         s = self.s
         wd = self.app.tb.workdir
-        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=0,
-                    desc="Return to the General tab (or backspace / 1).")
+        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC)
         out = [back,
                Item("_soul_new", "Create a new soul…", "action", lambda: None, lambda v: self._soul_req("create"),
                     desc="Name it, Finch writes a template to ~/.finch/souls/<name>.md and opens it in your editor."),
@@ -166,8 +244,7 @@ class SettingsMenu:
 
     def schedule_items(self):
         jobs = SCH.load_jobs()
-        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=0,
-                    desc="Return to the General tab (or backspace / 1).")
+        back = Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC)
         out = [back,
                Item("_sched_new", "New scheduled job…", "action", lambda: None, lambda v: self._sched_req("new"),
                     desc="Choose when (one-off or recurring, with a live preview of the next runs), what Finch should "
@@ -185,6 +262,70 @@ class SettingsMenu:
                                  + (f"\n  last output: {last[-1][:150]}" if last else "")))
         return out
 
+    def _prof_summary(self):
+        profs = config.list_profiles()
+        cur = next((p["name"] for p in profs if not config.profile_diff(self.s, p["data"])), None)
+        return (f"{len(profs)} saved" if profs else "none saved") + (f", current: {cur}" if cur else "")
+
+    def profile_items(self):
+        profs = config.list_profiles()
+        out = [Item("_back", "‹ Back to General", "nav", lambda: "", target=GENERAL, desc=BACK_DESC),
+               Item("_prof_save", "Save current settings as a profile…", "action", lambda: None,
+                    lambda v: self._prof_req("save"),
+                    desc="Stores model, context, thinking, theme, soul, tricks, tools, skills and the rest of the "
+                         f"General settings in {config.PROFILES_DIR}/<name>.json."),
+               Item("_h_profs", f"Profiles ({len(profs)})  ·  enter on a profile to load, update or delete" if profs
+                    else "No profiles yet: save one above, or type /profile save <name>", "header", lambda: None)]
+        for p in profs:
+            diff = config.profile_diff(self.s, p["data"])
+            out.append(Item(p["name"], p["name"], "profile", lambda: None,
+                            desc=("Matches the current settings." if not diff else
+                                  "Differs from the current settings in: " + ", ".join(diff) + ".")
+                                 + f"  ·  {p['path']}"))
+        return out
+
+    def _prof_req(self, kind, name=None):
+        self.prof_request = (kind, name)
+        self.application.exit(result="profile")
+
+    def _handle_prof_request(self):
+        kind, name = self.prof_request
+        try:
+            if kind == "save":
+                name = _ask(self.app, "Profile name (letters, digits, _ . -)")
+                if not name:
+                    self.flash = "cancelled"
+                    return
+                if os.path.exists(config.profile_path(name)) and choose(
+                        self.app, f"Profile '{name}' exists. Overwrite it?",
+                        [("no", "Keep the saved one"), ("yes", f"Overwrite '{name}' with the current settings")]) != "yes":
+                    self.flash = "kept"
+                    return
+                config.save_profile(self.s, name)
+                self.flash = f"saved profile '{name}'"
+                return
+            act = choose(self.app, f"Profile '{name}'", [("load", "Load it (replaces the current settings)"),
+                                                         ("update", "Update it with the current settings"),
+                                                         ("delete", "Delete…"), ("cancel", "Back")])
+            if act == "load":
+                self.flash = self.app.load_profile(name)
+                try:
+                    self.models = self.app.backend.list_models()
+                except Exception:
+                    pass
+            elif act == "update":
+                config.save_profile(self.s, name)
+                self.flash = f"profile '{name}' updated with the current settings"
+            elif act == "delete":
+                if choose(self.app, f"Delete profile '{name}'?",
+                          [("no", "Keep it"), ("yes", f"Delete '{name}'")]) == "yes":
+                    config.delete_profile(name)
+                    self.flash = f"deleted profile '{name}'"
+        except (EOFError, KeyboardInterrupt):
+            self.flash = "cancelled"
+        except ValueError as e:
+            self.flash = str(e)
+
     def _toggle_daemon(self, on):
         self.flash = SCH.start_daemon()[1] if on else SCH.stop_daemon()
 
@@ -201,8 +342,19 @@ class SettingsMenu:
             self.s.set_trick(k, on)
         self.flash = "all tricks " + ("enabled" if on else "disabled")
 
+    def _all_tools(self, on):
+        for k in self._tool_keys():
+            self.s.set_tool(k, on)
+        self.flash = "all tools " + ("enabled" if on else "disabled (finish stays on)")
+
+    def _all_skills(self, on):
+        for n in self._skill_names():
+            self.s.set_skill(n, on)
+        self.flash = "all skills " + ("enabled" if on else "disabled")
+
     def items(self):
-        return (self.general_items, self.trick_items, self.theme_items, self.soul_items, self.schedule_items)[self.tab]()
+        return (self.general_items, self.trick_items, self.tool_items, self.skill_items, self.theme_items,
+                self.soul_items, self.schedule_items, self.profile_items)[self.tab]()
 
     # ---------------- rendering ----------------
     def _selectable(self, items):
@@ -217,9 +369,9 @@ class SettingsMenu:
         for i, t in enumerate(TABS):
             out.append(("class:sm.tab.current" if i == self.tab else "class:sm.tab", f" {i + 1} {t} "))
             out.append(("", " "))
-        if self.tab == 1:
-            n_on = sum(1 for k in TR.KEYS if self.s.on(k))
-            out.append(("class:sm.desc", f"   {n_on}/{len(TR.KEYS)} on"))
+        bools = [it for it in items if it.kind == "bool"]
+        if self.tab in (TRICKS, TOOLS, SKILLS) and bools:
+            out.append(("class:sm.desc", f"   {sum(1 for it in bools if it.get())}/{len(bools)} on"))
         out.append(("", "\n\n"))
         try:
             rows = self.application.output.get_size().rows
@@ -247,8 +399,9 @@ class SettingsMenu:
         out.append(("class:sm.desc", "  " + (it.desc or "") + "\n"))
         if self.flash:
             out.append(("class:sm.value", "  " + self.flash + "\n"))
-        out.append(("class:sm.help", "  ↑↓ move · ←→ change · enter select/open · 1 General · 2 Tricks · 3 Theme · 4 Soul · "
-                                     "5 Schedule · tab next tab · esc save & close"))
+        out.append(("class:sm.help", "  ↑↓ move · ←→ change · enter select/open · "
+                                     + " · ".join(f"{i + 1} {t}" for i, t in enumerate(TABS))
+                                     + " · tab next tab · esc save & close"))
         return out
 
     def _value_frag(self, it):
@@ -258,6 +411,8 @@ class SettingsMenu:
             return [("class:sm.value", f"‹ {it.fmt(it.get())} ›")]
         if it.kind == "action":
             return [("class:sm.desc", "↵")]
+        if it.kind == "locked":
+            return [("class:sm.on", "● on "), ("class:sm.desc", "  always")]
         if it.kind == "nav":
             v = it.get()
             return [("class:sm.value", f"{v}  ›" if v else "")] if it.target else [("", "")]
@@ -266,6 +421,14 @@ class SettingsMenu:
             meta = f"  {info['scope']} · ~{info['tokens']} tok" if info else "  0 tok"
             mark = [("class:sm.on", "  ✓ active")] if (it.get() or "") == it.key else []
             return [("class:sm.desc", meta)] + mark
+        if it.kind == "profile":
+            p = next((x for x in config.list_profiles() if x["name"] == it.key), None)
+            if not p:
+                return [("", "")]
+            d = p["data"]
+            mark = [("class:sm.on", "  ✓ current")] if not config.profile_diff(self.s, d) else []
+            return [("class:sm.desc", f"{d.get('model') or '-'} · ctx {int(d.get('num_ctx') or 0) // 1024}K · "
+                                      f"{d.get('theme', '-')} · soul {d.get('soul') or 'none'}")] + mark
         if it.kind == "job":
             j = SCH.find(it.key)
             if not j:
@@ -307,6 +470,8 @@ class SettingsMenu:
             self.goto(it.target)
         elif it.kind == "job" and activate:
             self._sched_req("job", it.key)
+        elif it.kind == "profile" and activate:
+            self._prof_req("actions", it.key)
         elif it.kind == "soul" and (activate or step):
             it.set(it.key)
             self.flash = f"soul set to {it.key or 'none'}"
@@ -408,6 +573,10 @@ class SettingsMenu:
             if res == "soul":
                 self._handle_soul_request()
                 continue
+            if res == "profile":
+                self._handle_prof_request()
+                self._restyle()
+                continue
             if res == "edit" and self.edit_request is not None:
                 it = self.edit_request
                 try:
@@ -465,7 +634,7 @@ def edit_soul(app, name):
     ed = souls.editor_cmd()
     if not ed:
         return f"no editor found (set $EDITOR). Edit the file directly: {path}"
-    subprocess.call(ed.split() + [path])
+    subprocess.call(ed + [path])
     return f"saved {path}"
 
 
@@ -642,10 +811,10 @@ def new_job_wizard(app):
 
 def _view_log(path):
     import shutil
-    pager = os.environ.get("PAGER") or ("less" if shutil.which("less") else "")
+    pager = osutil.split_cmd(os.environ.get("PAGER") or ("less" if shutil.which("less") else ""))
     if pager:
-        cmd = pager.split() + (["+G"] if pager.split()[0] == "less" else []) + [path]
-        subprocess.call(cmd)
+        less = os.path.splitext(os.path.basename(pager[0]))[0].lower() == "less"
+        subprocess.call(pager + (["+G"] if less else []) + [path])
         return f"log: {path}"
     print(SCH.tail(path, 80))
     try:
