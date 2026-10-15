@@ -83,7 +83,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 | `/soul` | switch persona (interactive Soul tab) · `/soul <name>` · `/soul off` · `/soul list` · `/soul show` · `/soul new <name>` · `/soul edit [name]` |
 | `/schedule` | scheduled jobs (interactive Schedule tab) · `/schedule <when> <task>` · `/schedule new` (guided) · `list` · `run` · `pause` · `resume` · `rm` · `log` · `when <job> <when>` · `daemon start\|stop\|status` |
 | `/profile` | settings profiles (interactive Profiles tab) · `/profile <name>` loads one · `/profile save <name>` · `list` · `rm <name>` |
-| `/tricks` | interactive trick toggles · `/tricks list` prints them · `/tricks <key> on\|off` · `/tricks all off` for a raw model |
+| `/tricks` | interactive trick toggles · `/tricks list` prints them · `/tricks <key>` explains one · `/tricks <key> on\|off` · `/tricks all off` for a raw model |
 | `/tools` | interactive tool toggles (Tools tab) · `/tools list` · `/tools run_bash off` · `/tools <mcp server> off` · `/tools all on` |
 | `/skills` | interactive skill toggles (Skills tab) · `/skills list` · `/skills bug_fix off` · `/skills all off` |
 | `/model [name]` | pick or switch model (shows size + tools/thinking/vision capabilities) |
@@ -108,7 +108,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 | …tell chit-chat from work | **Q&A/task layering**: questions get a chat system prompt and read-only tools, answer once and stop; write/run calls are blocked in chat mode. Short follow-ups continue an in-progress task. | `heuristics.is_qa`, `agent._loop` |
 | …escape tool loops | **Signature-level anti-loop ladder**: identical consecutive call is blocked (3×); 5-in-a-row nudge; 8 in a row with 4 identical → tool disabled; calling a disabled tool: nudge at 3, **context hard reset** at 10. Research guard counts only *repeated identical* queries. Todo guard. Per-tool failure ladder: 3 fails → strategy hint (edit_file → disabled, rewrite with create_file). | `agent._loop` |
 | …stop circling on one file | **Shotgun-edit guard**: 4 successful edits of the same file without convergence → "find the root cause first" (2 hints max, never disables). | `heuristics.EditConvergenceGuard` |
-| …recover from empty output | **Empty-turn ladder**: nudge at 3, hard reset to task + plan + file listing at 6 (max 3 resets), then graceful exit. Unclosed `<think>` counts as empty. Truncation at the token cap gets **"skeleton then append"** chunking feedback. | `agent._loop` |
+| …recover from empty output | **Empty-turn ladder**: nudge at 3, hard reset to task + plan + file listing at 6 (max 3 resets), then graceful exit. Unclosed `<think>` counts as empty. Truncation at the token cap gets **"skeleton then append"** chunking feedback. A reply that **stalls** (no data for `stream_timeout`, usually one huge tool call) gets "write it in pieces" feedback, stricter each time, instead of an identical retry. | `agent._loop` |
 | …emit valid tool calls | **Format-leak salvage**: JSON in text, ```json fences, `<tool_call>` tags, gemma `call:name{…}`, placeholder quotes `<\|"\|>`, bare `finish(summary="x")`. Tool-name aliases (`write_file`, `bash`, …) and argument aliases (`file_path`, `cmd`, …). Missing-argument errors include a correct example. | `heuristics.try_parse_tool_calls`, `tools.ALIASES` |
 | …self-debug | **Test guard**: when tests exist, the harness runs them itself before accepting `finish` and feeds back the exact failure (`file:line` + the `E` line). pytest → unittest fallback → skip if Python is missing. A broken third-party pytest plugin is detected and retried with autoload off. | `heuristics.run_test_guard` |
 | …stay honest at the end | **Finish gates**, each capped so they can't deadlock: fake finish (no work done) · test guard · claimed files must exist · files named in the plan must exist · plan must be ticked · **delivery self-check** re-injects the original task once. An empty final summary triggers a wrap-up call. | `agent._finish_gates` |
@@ -157,6 +157,23 @@ Be direct: match the length of your reply to the weight of the ask…
 Every character is sent with every request, so the picker shows each soul's token cost. Souls are capped at
 4,000 characters. Editing a built-in soul copies it to `~/.finch/souls/` first.
 
+## Custom system prompt
+
+`/settings` → General → **System prompt** chooses how your own text is used, and **Edit system prompt…** opens it in
+`$VISUAL` / `$EDITOR`:
+
+| Mode | Effect |
+|---|---|
+| built-in | Finch's own prompt only (your text is kept but not sent) |
+| built-in + yours | your text is added under `# Custom instructions` in task **and** chat mode |
+| yours | your text replaces the task-mode prompt; chat mode keeps its short built-in prompt |
+
+In "yours" mode an empty prompt starts as a copy of the built-in one, so you can change it rather than start from
+nothing. Keep the tool rules (todo, enable_tools, finish) if you do: small models lean on them. `{workdir}`, `{home}`,
+`{os}`, `{shell}` and `{python}` are filled in. The soul, FINCH.md and "Force English" still apply on top.
+**Reset system prompt** deletes your text. Both are saved in config.json (`system_prompt`, `system_prompt_mode`) and
+in profiles.
+
 ## Scheduled jobs
 
 Finch can run a task later, once or on a schedule. A job is a task, a folder and a schedule:
@@ -201,11 +218,15 @@ status bar shows the next or running job.
 
 ## Toggleable tricks
 
-Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 35 of them in 7 groups) that
+Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 36 of them in 7 groups) that
 can be switched off. Use the Tricks tab in `/settings`, `/tricks <key> off`, `"tricks": {"crawl_guard": false}`
 in config.json, or `FINCH_ABLATION=key1,key2` (Mingbird's ablation names `finish_gate`, `anti_loop` and
 `flat_prefill` are accepted as aliases). "Disable all tricks" gives you a plain agent loop for comparison.
-The toolbar shows how many tricks are off. **The hard safety ring (irreversible commands) can't be
+The toolbar shows how many tricks are off.
+
+Not sure what a trick does? Select it in the Tricks tab: under the one-line summary is a plain-language
+explanation of the problem it solves, what it does, and what changes when you turn it off. `/tricks <key>`
+(e.g. `/tricks crawl_guard`) prints the same explanation. **The hard safety ring (irreversible commands) can't be
 turned off.**
 
 ## Toggleable tools and skills
@@ -221,7 +242,7 @@ An MCP server is switched as a whole (all its `server.tool` tools). A skill that
 ## Settings profiles
 
 A profile is a named snapshot of everything `/settings` saves: model, context window, output cap, thinking, temperature,
-keep-alive, command timeout, theme, soul, tricks, tools, skills, offline, verbose, language, and the model server
+keep-alive, command timeout, stall timeout, theme, soul, tricks, tools, skills, offline, verbose, language, and the model server
 (host, backend, OpenAI-compatible URL). Profiles live in `~/.finch/profiles/<name>.json`.
 
 - **Save:** `/profile save <name>`, or "Save current settings as a profile…" in the Profiles tab (key 8). Saving
@@ -242,8 +263,15 @@ keep-alive, command timeout, theme, soul, tricks, tools, skills, offline, verbos
 {"model": "gemma4:12b", "num_ctx": 32768, "think": null, "host": "http://127.0.0.1:11434", "theme": "claude",
  "tricks": {"self_check": false}, "tools_off": ["web_fetch"], "skills_off": [],
  "backend": "ollama", "openai_base_url": "http://127.0.0.1:1234/v1",
- "num_predict": 8192, "keep_alive": "30m", "bash_timeout": 120}
+ "num_predict": 8192, "keep_alive": "30m", "bash_timeout": 120, "stream_timeout": 900}
 ```
+
+`stream_timeout` (General tab: "Stall timeout") is how long a reply may go without sending any data. Ollama sends
+nothing at all while the model writes a tool call, so writing a whole program in one `create_file` on a slow or large
+model can be silent for minutes. When the limit is hit you see `reply stalled for 900s … asking for smaller pieces`
+and the model is told to write the file in parts (the `stall_feedback` trick). If big models still stall, raise it.
+The old `api_timeout` key (240 s, which caused random `stream error: timed out` on big writes) is read as a
+minimum for `stream_timeout` and otherwise ignored.
 
 Env overrides: `OLLAMA_HOST`, `FINCH_SOUL`, `FINCH_MODEL`, `FINCH_CTX`, `FINCH_THINK`, `FINCH_TEMP`, `FINCH_OFFLINE=1`,
 `FINCH_THEME`, `FINCH_UNSAFE=1`, `FINCH_ALLOW_ENV_MUTATION=1`, `FINCH_OLLAMA_RESTART_CMD`, `FINCH_HOME`, `FINCH_SHELL`,
@@ -262,6 +290,6 @@ MCP (`~/.finch/mcp.json`):
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests
 ```
 
-162 tests, no backend needed; they pass on Linux and natively on Windows. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
+192 tests, no backend needed; they pass on Linux and natively on Windows. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
 prints the screen (see its docstring). The suite includes a scripted fake model that drives the full loop through the finish gates, the
 anti-loop ladder, the empty-turn ladder and the chat mode. It doesn't need a running backend.

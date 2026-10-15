@@ -11,6 +11,8 @@ from prompt_toolkit.styles import Style
 
 import os
 import subprocess
+import tempfile
+import textwrap
 
 from . import config, osutil, scheduler as SCH, souls, themes, tools as T, tricks as TR
 
@@ -20,12 +22,13 @@ BACK_DESC = "Return to the General tab (or backspace / 1)."
 
 
 class Item:
-    def __init__(self, key, label, kind, get, set=None, options=None, desc="", fmt=None, group=None, target=None):
+    def __init__(self, key, label, kind, get, set=None, options=None, desc="", fmt=None, group=None, target=None, detail=""):
         self.key, self.label, self.kind = key, label, kind      # kind: bool|choice|int|action|nav|theme|header|locked|profile
         self.target = target                                     # nav: tab index to open
         self.get, self.set = get, set
         self.options = options or []
         self.desc = desc
+        self.detail = detail                                     # longer explanation under desc
         self.fmt = fmt or (lambda v: str(v))
         self.group = group
 
@@ -60,6 +63,7 @@ class SettingsMenu:
     def general_items(self):
         s, app = self.s, self.app
         think_fmt = {None: "auto (model default)", True: "on", False: "off"}
+        sys_fmt = {"builtin": "built-in", "append": "built-in + yours", "replace": "yours (replaces built-in)"}
 
         def set_model(v):
             app.set_model(v, quiet=True)
@@ -106,6 +110,10 @@ class SettingsMenu:
             Item("bash_timeout", "Command timeout", "int", lambda: s.bash_timeout,
                  lambda v: setattr(s, "bash_timeout", max(5, int(v))), [30, 60, 120, 300, 600, 1800],
                  "Seconds before run_bash / run_python is killed (whole process tree).", fmt=lambda v: f"{v}s"),
+            Item("stream_timeout", "Stall timeout", "int", lambda: s.stream_timeout,
+                 lambda v: setattr(s, "stream_timeout", max(60, int(v))), [300, 600, 900, 1800, 3600],
+                 "Silence allowed once a reply is streaming. Ollama sends nothing while the model writes a tool "
+                 "call, so a big file on a slow model needs minutes.", fmt=lambda v: f"{v}s"),
             Item("mode", "Routing", "choice", lambda: app.agent.force_mode,
                  lambda v: setattr(app.agent, "force_mode", v), [None, "task", "chat"],
                  "Force every message to task or chat mode, or let Q&A layering decide (auto). Not persisted.",
@@ -121,7 +129,31 @@ class SettingsMenu:
             Item("lang_hint", "Force English", "bool", lambda: s.lang_hint == "en",
                  lambda v: setattr(s, "lang_hint", "en" if v else ""),
                  desc="Append 'Always respond in English' to the system prompt."),
+            Item("system_prompt_mode", "System prompt", "choice", lambda: s.system_prompt_mode,
+                 lambda v: setattr(s, "system_prompt_mode", v), ["builtin", "append", "replace"],
+                 "built-in: Finch's own. built-in + yours: your text is added to every prompt (task and chat). "
+                 "yours: your text replaces the task prompt (chat keeps its own). Soul, FINCH.md still apply.",
+                 fmt=lambda v: sys_fmt.get(v, v)),
+            Item("_sys_edit", "Edit system prompt…", "action", self._sys_summary, lambda v: self._sys_req(),
+                 desc="Open your system prompt in $VISUAL / $EDITOR. In 'yours' mode an empty prompt starts from "
+                      "the built-in one. {workdir} {home} {os} {shell} {python} are filled in."),
+            Item("_sys_reset", "Reset system prompt", "action", lambda: None, lambda v: self._sys_reset(),
+                 desc="Delete your text and go back to the built-in system prompt."),
         ]
+
+    def _sys_summary(self):
+        text = (self.s.system_prompt or "").strip()
+        if not text:
+            return "empty"
+        n = text.count("\n") + 1
+        return f"{n} line{'s' if n != 1 else ''}" + ("" if self.s.system_prompt_mode != "builtin" else ", unused")
+
+    def _sys_req(self):
+        self.application.exit(result="sysprompt")
+
+    def _sys_reset(self):
+        self.s.system_prompt, self.s.system_prompt_mode = "", "builtin"
+        self.flash = "system prompt reset to built-in"
 
     def trick_items(self):
         s = self.s
@@ -137,7 +169,8 @@ class SettingsMenu:
             for key, grp, label, desc in TR.TRICKS:
                 if grp == g:
                     out.append(Item(key, label, "bool", (lambda k=key: s.on(k)),
-                                    (lambda v, k=key: s.set_trick(k, v)), desc=desc, group=g))
+                                    (lambda v, k=key: s.set_trick(k, v)), desc=desc, group=g,
+                                    detail=TR.DETAILS.get(key, "")))
         return out
 
     def _mcp_servers(self):
@@ -374,11 +407,28 @@ class SettingsMenu:
             out.append(("class:sm.desc", f"   {sum(1 for it in bools if it.get())}/{len(bools)} on"))
         out.append(("", "\n\n"))
         try:
-            rows = self.application.output.get_size().rows
+            size = self.application.output.get_size()
+            rows, cols = size.rows, size.columns
         except Exception:
-            rows = 30
-        height = max(6, min(len(items), rows - 9))
+            rows, cols = 30, 100
+        cols = max(cols, 20)
+        it = items[cur_idx]
+        wrap = max(30, cols - 4)
+        desc = textwrap.wrap(it.desc or "", wrap) or [""]
+        detail = textwrap.wrap(it.detail, wrap)
+        help_text = ("  ↑↓ move · ←→ change · enter select/open · "
+                     + " · ".join(f"{i + 1} {t}" for i, t in enumerate(TABS)) + " · tab next tab · esc save & close")
+        # the list gets whatever the tab bar, description and help line (all of which may wrap) leave over
+        lines = lambda frags: -(-len("".join(t for _, t in frags)) // cols)
+        budget = (rows - lines(out) - 2 - len(desc) - (len(detail) + 1 if detail else 0)
+                  - (1 if self.flash else 0) - -(-len(help_text) // cols))
+        used = lambda t, h: (h + sum(1 for i in range(t, min(len(items), t + h)) if i and items[i].kind == "header")
+                             + (t > 0) + (t + h < len(items)))
+        height = min(len(items), max(6, budget))
         top = max(0, min(cur_idx - height // 2, len(items) - height))
+        while height > 6 and used(top, height) > budget:
+            height -= 1
+            top = max(0, min(cur_idx - height // 2, len(items) - height))
         width = max(len(it.label) for it in items if it.kind != "header") + 2
         if top > 0:
             out.append(("class:sm.desc", "   ↑ more\n"))
@@ -394,14 +444,13 @@ class SettingsMenu:
             out.append(("", "\n"))
         if top + height < len(items):
             out.append(("class:sm.desc", "   ↓ more\n"))
-        it = items[cur_idx]
         out.append(("", "\n"))
-        out.append(("class:sm.desc", "  " + (it.desc or "") + "\n"))
+        out.append(("class:sm.value" if detail else "class:sm.desc", "".join(f"  {ln}\n" for ln in desc)))
+        if detail:
+            out.append(("class:sm.desc", "\n" + "".join(f"  {ln}\n" for ln in detail)))
         if self.flash:
             out.append(("class:sm.value", "  " + self.flash + "\n"))
-        out.append(("class:sm.help", "  ↑↓ move · ←→ change · enter select/open · "
-                                     + " · ".join(f"{i + 1} {t}" for i, t in enumerate(TABS))
-                                     + " · tab next tab · esc save & close"))
+        out.append(("class:sm.help", help_text))
         return out
 
     def _value_frag(self, it):
@@ -410,7 +459,8 @@ class SettingsMenu:
         if it.kind in ("choice", "int"):
             return [("class:sm.value", f"‹ {it.fmt(it.get())} ›")]
         if it.kind == "action":
-            return [("class:sm.desc", "↵")]
+            v = it.get()
+            return [("class:sm.desc", f"{v}  ↵" if v else "↵")]
         if it.kind == "locked":
             return [("class:sm.on", "● on "), ("class:sm.desc", "  always")]
         if it.kind == "nav":
@@ -573,6 +623,9 @@ class SettingsMenu:
             if res == "soul":
                 self._handle_soul_request()
                 continue
+            if res == "sysprompt":
+                self.flash = edit_system_prompt(self.app)
+                continue
             if res == "profile":
                 self._handle_prof_request()
                 self._restyle()
@@ -636,6 +689,42 @@ def edit_soul(app, name):
         return f"no editor found (set $EDITOR). Edit the file directly: {path}"
     subprocess.call(ed + [path])
     return f"saved {path}"
+
+
+def edit_system_prompt(app):
+    """Edit the custom system prompt in the user's editor (multiline prompt if none). Returns a status message."""
+    from .agent import SYSTEM
+    s = app.s
+    text = s.system_prompt or (SYSTEM if s.system_prompt_mode == "replace" else "")
+    ed = souls.editor_cmd()
+    try:
+        if ed:
+            fd, path = tempfile.mkstemp(prefix="finch-system-", suffix=".md")
+            os.close(fd)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                subprocess.call(ed + [path])
+                with open(path, encoding="utf-8") as f:
+                    new = f.read()
+            finally:
+                os.remove(path)
+        else:
+            from prompt_toolkit import prompt
+            print("  no editor found ($EDITOR); type the prompt, esc then enter to finish")
+            new = prompt("  › ", default=text, multiline=True)
+    except (EOFError, KeyboardInterrupt, OSError) as e:
+        return "cancelled" if not isinstance(e, OSError) else f"edit failed: {e}"
+    new = new.strip()
+    if new == (s.system_prompt or "").strip():
+        return "system prompt unchanged"
+    s.system_prompt = new
+    if not new:
+        s.system_prompt_mode = "builtin"
+        return "system prompt cleared: using built-in"
+    if s.system_prompt_mode == "builtin":
+        s.system_prompt_mode = "append"
+    return f"system prompt saved ({len(new)} chars, mode: {s.system_prompt_mode})"
 
 
 def pick_theme(app):

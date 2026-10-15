@@ -1,6 +1,7 @@
 import os
 import sys as _sys
 import threading
+import time
 
 import pytest
 
@@ -365,6 +366,12 @@ def test_every_trick_key_is_referenced_in_code():
     assert not missing, missing
 
 
+def test_every_trick_has_a_detailed_explanation():
+    assert set(TR.DETAILS) == set(TR.KEYS)
+    short = [k for k, v in TR.DETAILS.items() if len(v) < 120]
+    assert not short, short
+
+
 def test_ablation_aliases_expand(monkeypatch):
     monkeypatch.setenv("FINCH_ABLATION", "anti_loop,crawl_guard")
     s = config.load_settings()
@@ -487,6 +494,31 @@ def test_soul_injected_in_task_and_chat(tmp_path):
     a.s.soul = ""
     a.run_turn("write o.txt containing x")
     assert "# Soul" not in llm.calls[-1][0]["content"]
+
+
+def test_custom_system_prompt_modes(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    a.s.system_prompt = "Always cite {workdir}. {not_a_var}"
+    a.s.system_prompt_mode = "builtin"
+    assert "Always cite" not in a.system_prompt(False)            # text kept but unused
+    a.s.system_prompt_mode = "append"
+    for qa in (False, True):
+        p = a.system_prompt(qa)
+        assert "# Custom instructions\nAlways cite " + str(tmp_path) + ". {not_a_var}" in p
+        assert p.startswith("You are Finch")
+    a.s.system_prompt_mode = "replace"
+    assert a.system_prompt(False).startswith("Always cite " + str(tmp_path))
+    assert "JUDGE INTENT" not in a.system_prompt(False)
+    assert "Always cite" not in a.system_prompt(True)             # chat keeps its own prompt
+    a.s.soul = "pirate"
+    assert a.system_prompt(False).startswith("# Soul (pirate)")
+
+
+def test_system_prompt_persisted(tmp_path):
+    s = settings(system_prompt="be brief", system_prompt_mode="append")
+    config.save_settings(s)
+    s2 = config.load_settings()
+    assert (s2.system_prompt, s2.system_prompt_mode) == ("be brief", "append")
 
 
 # ---------------- scheduler ----------------
@@ -773,8 +805,111 @@ def test_first_byte_timeout_becomes_llm_error(monkeypatch):
         raise TimeoutError("timed out")
     monkeypatch.setattr(llm, "_post", boom)
     for b in (llm.OllamaBackend(settings()), llm.OpenAIBackend(settings())):
-        with pytest.raises(llm.LLMError, match="no response"):
+        with pytest.raises(llm.LLMError, match="no response") as ei:
             b.chat("m", [{"role": "user", "content": "hi"}])
+        assert ei.value.stalled        # a reply that opens with a huge tool call is silent from the start
+
+
+def test_legacy_api_timeout_migrates(finch_home):
+    config.atomic_write_json(config.CONFIG_FILE, {"api_timeout": 1800})
+    assert config.load_settings().stream_timeout == 1800
+    config.atomic_write_json(config.CONFIG_FILE, {"api_timeout": 240})
+    assert config.load_settings().stream_timeout == 900
+
+
+def _pausing_server(lines, pause):
+    """HTTP server that streams lines[0], sleeps `pause`, then streams the rest."""
+    import http.server, threading
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.end_headers()
+            try:
+                for i, ln in enumerate(lines):
+                    if i == 1:
+                        time.sleep(pause)
+                    self.wfile.write(ln.encode() + b"\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+OLLAMA_LINES = ['{"message": {"content": "Writing it"}}',
+                '{"message": {"tool_calls": [{"function": {"name": "create_file", "arguments": {"path": "a"}}}]}}',
+                '{"done": true, "prompt_eval_count": 5, "eval_count": 9}']
+OPENAI_LINES = ['data: {"choices": [{"delta": {"content": "Writing it"}}]}',
+                'data: {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "create_file", '
+                '"arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}', 'data: [DONE]']
+
+
+@pytest.mark.parametrize("kind", ["ollama", "openai"])
+def test_silence_mid_stream_uses_stream_timeout(kind):
+    from finch import llm
+    srv = _pausing_server(OLLAMA_LINES if kind == "ollama" else OPENAI_LINES, 1.0)
+    try:
+        s = settings(); s.stream_timeout = 5
+        s.host = s.openai_base_url = f"http://127.0.0.1:{srv.server_port}"
+        b = llm.OllamaBackend(s) if kind == "ollama" else llm.OpenAIBackend(s)
+        r = b.chat("m", [{"role": "user", "content": "hi"}])     # a 1s tool-call silence < stream_timeout
+        assert r["message"]["tool_calls"][0]["function"]["name"] == "create_file"
+        s.stream_timeout = 0.4
+        with pytest.raises(llm.LLMError, match="stalled") as ei:
+            b.chat("m", [{"role": "user", "content": "hi"}])
+        assert ei.value.stalled
+    finally:
+        srv.shutdown()
+
+
+class StallingLLM(FakeLLM):
+    stalls = 1
+
+    def chat(self, *a, **k):
+        if self.stalls:
+            self.stalls -= 1
+            self.calls.append([dict(m) for m in a[1]])
+            from finch.llm import LLMError
+            raise LLMError("stream stalled: no data for 900s mid-response", stalled=True)
+        return super().chat(*a, **k)
+
+
+def test_stall_feedback_asks_for_pieces(tmp_path, monkeypatch):
+    from finch import agent as A
+    slept = []
+    monkeypatch.setattr(A.time, "sleep", lambda t: slept.append(t))
+    a, _ = make_agent(tmp_path, [])
+    llm = a.llm = StallingLLM([("create_file", {"path": "o.txt", "content": "x"}), ("finish", {"summary": "done"})])
+    a.run_turn("write o.txt with an x in it")
+    assert any("stalled" in n and "append_file" in n for n in user_notes(llm))
+    assert not slept                                   # no back-off: the server isn't the problem
+
+
+def test_stall_feedback_escalates(tmp_path, monkeypatch):
+    from finch import agent as A
+    monkeypatch.setattr(A.time, "sleep", lambda t: None)
+    a, _ = make_agent(tmp_path, [])
+    llm = a.llm = StallingLLM([("create_file", {"path": "o.txt", "content": "x"}), ("finish", {"summary": "done"})])
+    llm.stalls = 3
+    a.run_turn("write o.txt with an x in it")
+    notes = [m["content"] for m in llm.calls[3] if "stalled" in str(m.get("content"))]
+    assert len(notes) == 1 and "3 times in a row" in notes[0] and "at most 50 lines" in notes[0]
+
+
+def test_stall_feedback_off_plain_retry(tmp_path, monkeypatch):
+    from finch import agent as A
+    slept = []
+    monkeypatch.setattr(A.time, "sleep", lambda t: slept.append(t))
+    a, _ = make_agent(tmp_path, [])
+    a.s.set_trick("stall_feedback", False)
+    llm = a.llm = StallingLLM([("create_file", {"path": "o.txt", "content": "x"}), ("finish", {"summary": "done"})])
+    a.run_turn("write o.txt with an x in it")
+    assert not any("stalled" in str(m.get("content")) for c in llm.calls for m in c)
+    assert slept == [3]
 
 
 # ---------------- partial-read gate ----------------

@@ -26,7 +26,7 @@ COMMANDS = {
     "/theme": "pick a theme (live preview), or /theme dracula",
     "/soul": "switch persona (interactive) · /soul <name> · off · list · show · new <name> · edit",
     "/profile": "settings profiles (interactive) · /profile <name> loads · save <name> · list · rm <name>",
-    "/tricks": "toggle harness tricks (interactive), /tricks list, or /tricks crawl_guard off",
+    "/tricks": "toggle harness tricks (interactive), /tricks list, /tricks crawl_guard (explain) or /tricks crawl_guard off",
     "/schedule": "scheduled jobs (interactive) · /schedule <when> <task> · list · new · run · pause · resume · rm · log",
     "/model": "list models or switch: /model gemma4:12b",
     "/think": "thinking: /think on | off | auto",
@@ -300,8 +300,17 @@ class App:
                               Text(label, style="bold"), Text(desc, style="dim"))
         self.console.print(t)
         n = sum(1 for k in TR.KEYS if self.s.on(k))
-        self.console.print(Text(f"{n}/{len(TR.KEYS)} on · toggle: /tricks <key> on|off · /tricks all on|off · "
-                                f"or use /settings", style="dim"))
+        self.console.print(Text(f"{n}/{len(TR.KEYS)} on · explain: /tricks <key> · toggle: /tricks <key> on|off · "
+                                f"/tricks all on|off · or use /settings", style="dim"))
+
+    def explain_trick(self, key):
+        _, grp, label, desc = TR.BY_KEY[key]
+        on = self.s.on(key)
+        self.console.print(Text.assemble((label, "bold"), ("  " + key + " · " + grp + " · ", "dim"),
+                                         ("● on" if on else "○ off", "ok" if on else "err")))
+        self.console.print(Text(desc))
+        self.console.print(Text(TR.DETAILS.get(key, ""), style="dim"))
+        self.console.print(Text(f"toggle: /tricks {key} {'off' if on else 'on'}", style="dim"))
 
     def tool_keys(self):
         return ([n for n in T.ALL_BUILTIN if n not in config.LOCKED_TOOLS]
@@ -542,6 +551,8 @@ class App:
                 self.open_settings(tab="Tricks")
             elif a == ["list"]:
                 self.show_tricks()
+            elif len(a) == 1 and a[0] in TR.BY_KEY:
+                self.explain_trick(a[0])
             elif len(a) == 2 and a[1] in ("on", "off"):
                 keys = TR.KEYS if a[0] == "all" else ([a[0]] if a[0] in TR.BY_KEY else [])
                 if not keys:
@@ -552,7 +563,7 @@ class App:
                 config.save_settings(s)
                 ui.notice(f"{a[0]} → {a[1]}", "ok" if a[1] == "on" else "warn")
             else:
-                ui.notice("usage: /tricks | /tricks list | /tricks <key> on|off | /tricks all on|off", "error")
+                ui.notice("usage: /tricks | /tricks list | /tricks <key> | /tricks <key> on|off | /tricks all on|off", "error")
         elif cmd == "/unsafe":
             s.set_trick("behaviour_tiering", s.unsafe)
             config.save_settings(s)

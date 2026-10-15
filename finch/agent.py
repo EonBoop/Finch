@@ -9,7 +9,7 @@ import uuid
 from . import config, heuristics as H, osutil, souls, tools as T
 from .llm import Cancelled, LLMError, model_params_b
 
-SYSTEM = """You are Finch, an autonomous agent working in a workspace directory on the user's machine.
+SYSTEM = """You are an autonomous agent working in a workspace directory on the user's machine.
 JUDGE INTENT FIRST:
 - Chit-chat, greetings, questions about yourself, general knowledge: answer directly in text. No tools, no todo, no files.
 - Real work (write/change files, run code, analyse data, research, fix bugs): first call todo(action=create) with a numbered plan, then execute it step by step with tools, ticking items off as you go.
@@ -22,7 +22,7 @@ RULES:
 System: {os}; shell: {shell}; python: {python}.
 Working directory (all commands and relative paths run here): {workdir}"""
 
-CHAT_SYSTEM = """You are Finch, a local AI assistant talking with the user.
+CHAT_SYSTEM = """You are a local AI assistant talking with the user.
 - Answer directly, naturally and concisely, like a person would.
 - Only use tools when you need to look something up (read a file, list a directory, search the web); otherwise just answer in text.
 - When you have answered, stop. Don't repeat yourself or list what you could do.
@@ -134,19 +134,37 @@ class Agent:
         self.cancel = None
 
     # ---------------- prompt assembly ----------------
+    def prompt_vars(self):
+        return {"home": os.path.expanduser("~"), "workdir": self.tb.workdir, "python": os.path.basename(self.s.python),
+                "os": f"{platform.system()} {platform.release().split('-')[0]}", "shell": osutil.shell_name()}
+
+    def custom_prompt(self):
+        """The user's system prompt text with {workdir}-style placeholders filled ("" when unused).
+        Plain replace, not str.format, so stray braces in the text are harmless."""
+        text = (self.s.system_prompt or "").strip()
+        if not text or self.s.system_prompt_mode not in ("append", "replace"):
+            return ""
+        for k, v in self.prompt_vars().items():
+            text = text.replace("{" + k + "}", v)
+        return text
+
     def system_prompt(self, qa):
         wd = self.tb.workdir
+        custom = self.custom_prompt()
+        mode = self.s.system_prompt_mode
         if qa:
             base = CHAT_SYSTEM.format(workdir=wd)
+        elif custom and mode == "replace":
+            base = custom
         else:
-            base = SYSTEM.format(home=os.path.expanduser("~"), workdir=wd, python=os.path.basename(self.s.python),
-                                 os=f"{platform.system()} {platform.release().split('-')[0]}",
-                                 shell=osutil.shell_name())
+            base = SYSTEM.format(**self.prompt_vars())
             if osutil.shell_hint():
                 base += "\n" + osutil.shell_hint()
         proj = os.path.join(wd, "FINCH.md")
         if not qa and os.path.isfile(proj):
             base += "\n\nProject notes (FINCH.md):\n" + T.read_text(proj)[:3000]
+        if custom and mode == "append":
+            base += "\n\n# Custom instructions\n" + custom
         if self.s.lang_hint == "en":
             base += "\nAlways respond in English."
         soul = souls.load(self.s.soul, wd)
@@ -403,6 +421,7 @@ class Agent:
                 r = self.llm.chat(sess.model, msgs, tools=ct, stream=True, on_token=on_tok,
                                   on_think=on_th, cancel=self.cancel, **kw)
                 st["fails"] = 0
+                st["stalls"] = 0
                 st["loop_clean"] += 1
                 if st["loop_clean"] >= 3:
                     st["loops"] = 0
@@ -454,6 +473,23 @@ class Agent:
                     st["compact_lvl"] = 3
                     continue
                 st["fails"] += 1
+                if e.stalled and on("stall_feedback") and st["fails"] < 8:
+                    # the same request would regenerate the same oversized tool call and stall again
+                    ui.notice(f"reply stalled for {s.stream_timeout}s (huge tool call?) → asking for smaller pieces "
+                              f"(retry {st['fails']}/8)", "warn")
+                    # replace the previous stall note with a stricter one: smaller pieces each time
+                    if msgs and str(msgs[-1].get("content", "")).startswith("⚠️ Your last reply stalled"):
+                        msgs.pop()
+                    st["stalls"] = st.get("stalls", 0) + 1
+                    lines = max(40, 150 // st["stalls"])
+                    how = (f"then append_file the rest, at most {lines} lines per call"
+                           if s.tool_on("append_file") else "then add the rest with edit_file in small steps")
+                    again = f" This has now happened {st['stalls']} times in a row." if st["stalls"] > 1 else ""
+                    msgs.append({"role": "user", "content": (
+                        f"⚠️ Your last reply stalled for {s.stream_timeout}s and was cut off: one tool call was "
+                        f"carrying too much content.{again} Do NOT write the whole file in one call. Write it in "
+                        f"pieces: create_file with only the first part (at most {lines} lines), {how}.")})
+                    continue
                 if e.code == 500 and st["fails"] >= 2 and on("error_recovery"):
                     # same messages on a degraded runner reproduce the same bad path: shrink the
                     # context AND change the message sequence

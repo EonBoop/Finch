@@ -74,7 +74,7 @@ class Settings:
     think: bool = None                 # tri-state: None = model default
     keep_alive: str = "30m"            # keep the model resident through long tool chains
     bash_timeout: int = 120
-    api_timeout: int = 240
+    stream_timeout: int = 900          # silence allowed in a reply (Ollama sends nothing while a tool call is written)
     python: str = ""                   # interpreter for run_python / test guard
     offline: bool = False              # web tools are not even assembled into the prompt
     allow_env_mutation: bool = False
@@ -85,6 +85,8 @@ class Settings:
     ablation: list = field(default_factory=list)
     theme: str = "claude"
     soul: str = ""                     # active SOUL.md persona ("" = none), see souls.py
+    system_prompt: str = ""            # user's custom system prompt text
+    system_prompt_mode: str = "builtin"  # builtin (text ignored) | append (after built-in) | replace (task prompt)
     tricks: dict = field(default_factory=dict)   # trick key -> bool (missing = on)
     tools_off: list = field(default_factory=list)    # built-in tool names and "mcp:<server>" turned off
     skills_off: list = field(default_factory=list)   # skill names hidden from the skills tool
@@ -131,6 +133,8 @@ def load_settings():
         for k, v in data.items():
             if k in names:
                 setattr(s, k, v)
+        if "api_timeout" in data and "stream_timeout" not in data:    # legacy key (was 240s)
+            s.stream_timeout = max(s.stream_timeout, int(data["api_timeout"]))
         if data.get("unsafe"):                     # legacy key
             s.set_trick("behaviour_tiering", False)
     except Exception:
@@ -178,7 +182,7 @@ def load_settings():
 
 
 PERSISTED = ("model", "num_ctx", "num_predict", "think", "offline", "host", "backend", "openai_base_url",
-             "temperature", "keep_alive", "bash_timeout", "theme", "soul", "tricks", "tools_off", "skills_off",
+             "temperature", "keep_alive", "bash_timeout", "stream_timeout", "theme", "soul", "system_prompt", "system_prompt_mode", "tricks", "tools_off", "skills_off",
              "verbose", "lang_hint")
 
 

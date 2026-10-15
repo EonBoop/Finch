@@ -11,16 +11,18 @@ Tricks carried over from Mingbird:
 """
 import json
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
 
 
 class LLMError(Exception):
-    def __init__(self, msg, code=None, body=""):
+    def __init__(self, msg, code=None, body="", stalled=False):
         super().__init__(msg)
         self.code = code
         self.body = body
+        self.stalled = stalled      # no data for stream_timeout seconds (often one huge tool call)
 
 
 class Cancelled(Exception):
@@ -89,6 +91,17 @@ def _post(url, payload, timeout, headers=None):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _no_data(e, where, timeout, mid=False):
+    """A socket timeout is silence, not a broken server: Ollama sends nothing at all while the model
+    writes a tool call, so one huge create_file can be minutes without a byte."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        what = "stream stalled: no data" if mid else "no response"
+        return LLMError(f"{what} from {where} for {timeout}s (timed out)", stalled=True)
+    if mid:
+        return LLMError(f"stream error: {e}")
+    return LLMError(f"no response from {where} ({e or type(e).__name__})")
+
+
 def _http_error(e):
     body = ""
     try:
@@ -153,7 +166,7 @@ class OllamaBackend:
         if think is False:       # off means off, even for models that think regardless of the flag
             on_think = None
         url = f"{self.host}/api/chat"
-        timeout = self.s.api_timeout if stream else 900
+        timeout = self.s.stream_timeout if stream else 900
         try:
             resp = _post(url, payload, timeout)
         except urllib.error.HTTPError as e:
@@ -165,13 +178,13 @@ class OllamaBackend:
                 except urllib.error.HTTPError as e2:
                     raise _http_error(e2)
                 except OSError as e2:
-                    raise LLMError(f"no response from Ollama within {timeout}s ({e2 or type(e2).__name__})")
+                    raise _no_data(e2, "Ollama", timeout)
             else:
                 raise err
         except urllib.error.URLError as e:
             raise LLMError(f"cannot reach Ollama at {self.host}: {e.reason}")
-        except OSError as e:     # socket timeout while waiting for the first byte (model loading / busy)
-            raise LLMError(f"no response from Ollama within {timeout}s ({e or type(e).__name__})")
+        except OSError as e:     # silent until the first byte: model loading, or a reply that opens with a tool call
+            raise _no_data(e, "Ollama", timeout)
         if not stream:
             with resp:
                 d = json.loads(resp.read())
@@ -231,7 +244,7 @@ class OllamaBackend:
         except (ValueError, OSError) as e:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
-            raise LLMError(f"stream error: {e}")
+            raise _no_data(e, "Ollama", timeout, mid=True)
         finally:
             try:
                 resp.close()
@@ -323,11 +336,11 @@ class OpenAIBackend:
         url = f"{self.host.rstrip('/')}/chat/completions"
         try:
             try:
-                resp = _post(url, payload, self.s.api_timeout, self._headers())
+                resp = _post(url, payload, self.s.stream_timeout, self._headers())
             except urllib.error.HTTPError as e:
                 if "reasoning_effort" in payload and e.code == 400:
                     payload.pop("reasoning_effort")    # server doesn't know the field: retry once
-                    resp = _post(url, payload, self.s.api_timeout, self._headers())
+                    resp = _post(url, payload, self.s.stream_timeout, self._headers())
                 else:
                     raise
         except urllib.error.HTTPError as e:
@@ -335,7 +348,7 @@ class OpenAIBackend:
         except urllib.error.URLError as e:
             raise LLMError(f"cannot reach {self.host}: {e.reason}")
         except OSError as e:
-            raise LLMError(f"no response from {self.host} within {self.s.api_timeout}s ({e or type(e).__name__})")
+            raise _no_data(e, self.host, self.s.stream_timeout)
         splitter = InlineThinkSplitter(on_token, on_think)
         thinks, calls = [], {}
         usage, finish = {}, None
@@ -371,6 +384,10 @@ class OpenAIBackend:
                         slot["args"] += fn.get("arguments") or ""
                     if c.get("finish_reason"):
                         finish = c["finish_reason"]
+        except (ValueError, OSError) as e:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            raise _no_data(e, self.host, self.s.stream_timeout, mid=True)
         finally:
             resp.close()
         splitter.flush()

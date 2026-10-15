@@ -64,6 +64,7 @@ Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `
 | Shotgun-edit guard | 4 successful edits to one file without converging → root-cause hint (at most 2 per file, never disables). |
 | Empty-turn ladder | Nudge at 3; hard reset (task + plan + file listing) at 6, at most 3 times; then a graceful stop. An unclosed `<think>` counts as empty. |
 | Truncation feedback | `done_reason=length` with nothing useful → "skeleton with create_file, then append_file". |
+| Stall feedback (Finch) | No data for `stream_timeout` (a huge tool call: Ollama streams nothing while one is written) → "write it in pieces", line budget shrinking per repeat, no back-off. |
 | Format-leak salvage | JSON, ```json fences, `<tool_call>`, gemma `call:name{…}`, `<\|"\|>` placeholder quotes, bare `finish(summary="x")`. |
 | Finish gates | Fake finish → test guard → claimed files exist → plan-named files exist → plan ticked → one-time re-injection of the original task. Every gate is capped so none can deadlock. |
 | Test guard | The harness runs pytest itself and feeds back the exact `file:line` and `E` line. Falls back to unittest, then skips if Python is missing. |
@@ -360,3 +361,68 @@ Goal: save the whole settings state under a name and switch between them.
 - Verified: 183 tests (12 new); pty: save two profiles, `/profile list` (current + "differs: num_ctx, theme"), Profiles tab
   render, load from the tab (ctx 64K→32K, hermes→claude live), `/profile big`, unknown name error, config.json updated.
   `finch --profile work -p` ran headless and left config.json unchanged; `--profile nope` exits 1 with a message.
+
+## Follow-up: custom system prompt
+
+Goal: let the user change the system prompt from General settings.
+
+- `Settings.system_prompt` (text) and `system_prompt_mode` (`builtin` | `append` | `replace`), both in `PERSISTED`, so
+  profiles pick them up. Keeping the mode separate from the text lets the user switch back to built-in without losing it.
+- `Agent.system_prompt`: `append` adds `# Custom instructions` after the built-in prompt in both modes; `replace` swaps
+  out `SYSTEM` for task turns only. Chat keeps `CHAT_SYSTEM` because a replacement is usually an edited task prompt that
+  mentions todo/finish, tools chat mode doesn't have. Placeholders are filled by `str.replace` from `prompt_vars()`, not
+  `str.format`, so stray braces in user text can't raise. The soul, FINCH.md, shell hint and lang hint still layer on.
+- Settings: three General rows (mode choice, "Edit system prompt…" action, reset). Edit uses the `application.exit`
+  pattern (result `"sysprompt"`) → `edit_system_prompt()`: temp file + `souls.editor_cmd()`, falling back to a multiline
+  prompt. In replace mode an empty text is pre-filled with the raw `SYSTEM` template. Saving text while in `builtin`
+  switches to `append`; saving empty text goes back to `builtin`. Action rows can now show a value before "↵".
+- Not a trick: it's a user setting, not a harness mechanism.
+- Verified: 185 tests (2 new); pty: rows render, edit via a fake `$EDITOR` saves and flips to append, replace mode
+  pre-fills the built-in prompt, esc persists to config.json. Live gemma4:12b with an appended "end every reply with
+  BANANA" rule: chat answer ended with BANANA.
+
+## Follow-up: trick explanations
+
+Goal: the one-line trick descriptions were shorthand ("60% truncate · 75% summarise · 90% rebuild") that only made
+sense if you'd read Mingbird. Users need to know what each trick is for before they switch it off.
+
+- `tricks.DETAILS` maps every key to a 2–4 sentence explanation: the small-model failure it addresses, what Finch does,
+  and what changes when it's off. Written from the call sites in agent/tools/safety (thresholds and caps match the code).
+  The `TRICKS` tuples are unchanged, so existing `for key, grp, label, desc in TRICKS` unpacking still works.
+- Settings: `Item.detail`; the footer shows the short desc (highlighted) and then the detail, both wrapped to the
+  terminal width with an indent. The list height is now fitted to what the tab bar, footer and help line actually use
+  (including their wrapping and the extra blank line before each group header). Before, it reserved a fixed 9 rows, so
+  the help line was already being pushed off on tabs with several group headers, and longer text made it worse.
+- `/tricks <key>` prints label, group, state, short desc, explanation and the toggle command.
+- Test: every key has a detail of at least 120 chars.
+- Verified: pty: Tricks tab at 110x50 shows desc + explanation + help without overflow; `/tricks stream_loop_guard`.
+  The pre-existing uncommitted `test_custom_system_prompt_modes` failure is unrelated (system prompt starts with
+  the built-in "You are an autonomous agent…", not "You are Finch").
+
+## Follow-up: stalled streams ("stream error: timed out")
+
+Symptom: `⚑ API error: stream error: timed out (retry 1/8 in 3s)`, seemingly at random, always when the model was about
+to write a big file (an Asteroids clone on qwen3.6 35b).
+
+Cause: `api_timeout` (240 s) was the urlopen socket timeout, i.e. the limit on silence between *any* two reads, not
+just the first byte. Ollama's tool-call parser buffers the whole call and sends it as one chunk when it is complete,
+so nothing at all arrives while the model generates a large `create_file`. Measured with gemma4:12b: a ~150-line file
+is 60–70 s of silence; a 35B model writing a full game easily passes 240 s. In real agent runs gemma opens with the
+tool call (zero content tokens), so the silence starts before the first byte, and a "first byte vs mid-stream"
+split doesn't help: the whole reply is one silence. The retry then sent the identical request, regenerated the same
+oversized call and timed out again.
+
+- `Settings.stream_timeout` (900 s, persisted, General tab "Stall timeout") replaces `api_timeout` for every
+  streamed request in both backends. A legacy `api_timeout` in config.json is used as a minimum.
+- `llm._no_data`: any socket timeout → `LLMError(stalled=True)` ("no response … for Ns" before the first byte,
+  "stream stalled: no data … for Ns" after it). The OpenAI backend now converts mid-stream OSErrors too (it used to
+  let a raw TimeoutError escape).
+- Trick `stall_feedback` (Output repair): on a stalled error, no back-off sleep; drop the previous stall note and add
+  a stricter one ("happened N times in a row", create_file with at most 150/N lines, min 40, then append_file).
+  Counts toward the 8-failure cap; `stalls` resets on a successful call. Off: the old back-off retry.
+- Tests: a local HTTP server that pauses mid-stream (both backends: survives a 1 s pause under a 5 s limit, raises
+  stalled under 0.4 s); stall nudge without sleep; escalation text; trick off → plain retry; legacy key migration.
+- Verified live with gemma4:12b and `stream_timeout` 40 s (so a whole-file write stalls): before escalation the model
+  ignored the nudge 4 times, then wrote 74 lines + append_file (294 s). With escalation it switched after one stall
+  each time: 55 lines + append_file, 136-line snake.py compiles (175 s). pty: "Stall timeout ‹ 900s ›" on General.
+
