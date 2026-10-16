@@ -85,7 +85,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 | `/profile` | settings profiles (interactive Profiles tab) · `/profile <name>` loads one · `/profile save <name>` · `list` · `rm <name>` |
 | `/tricks` | interactive trick toggles · `/tricks list` prints them · `/tricks <key>` explains one · `/tricks <key> on\|off` · `/tricks all off` for a raw model |
 | `/tools` | interactive tool toggles (Tools tab) · `/tools list` · `/tools run_bash off` · `/tools <mcp server> off` · `/tools all on` |
-| `/skills` | interactive skill toggles (Skills tab) · `/skills list` · `/skills bug_fix off` · `/skills all off` |
+| `/skills` | interactive skill toggles (Skills tab) · `/skills list` · `/skills bug_fix off` · `/skills all off` · `/skills new <name>` · `/skills import <file>` · `/skills edit [name]` · `/skills rm [name]` |
 | `/model [name]` | pick or switch model (shows size + tools/thinking/vision capabilities) |
 | `/think on\|off\|auto` | thinking tri-state (`auto` = don't send the field; model default) |
 | `/ctx 64k` | context window (`num_ctx`) |
@@ -238,6 +238,37 @@ can't be loaded by `enable_tools`, auto-loading or `batch_tools`, and a call to 
 An MCP server is switched as a whole (all its `server.tool` tools). A skill that is off disappears from
 `skills list` and can't be loaded; with every skill off the `skills` tool itself leaves the prompt.
 **`finish` can't be turned off**: the finish gates depend on it. The toolbar shows how many tools are off.
+
+## Custom skills
+
+A skill is a markdown file of step-by-step instructions the model loads when a task fits. The model picks
+skills by their one-line `description`, so make it say when to use the skill:
+
+```markdown
+---
+name: standup
+description: Write the daily standup report from the git log
+---
+# Standup report
+1. Run `git log --since=yesterday --oneline` in the project.
+2. Write STANDUP.md with three headings: "## Yesterday", "## Today", "## Blockers".
+3. Verify: read STANDUP.md back before calling finish.
+```
+
+Skills are looked up in `<project>/.finch/skills/` first, then `~/.finch/skills/`, then the built-ins. A skill
+with the same name as a built-in replaces it. To add one:
+
+- **`/skills new standup`**, or *Create a new skill…* on the Skills tab: asks for the description and where the
+  skill should live (your skills, or this project's), writes a template and opens it in `$VISUAL` / `$EDITOR`.
+- **`/skills import path/to/file.md`**, or *Import a skill file…*: copies an existing `.md` / `.txt` file in. A
+  Claude-style `pdf-tools/SKILL.md` is imported under its frontmatter `name`.
+- **`/skills edit [name]`**, or *Edit a skill…*: opens it in your editor. Editing a built-in copies it to
+  `~/.finch/skills/` first, and the copy is used from then on.
+- **`/skills rm [name]`**, or *Delete a skill…*: deletes one of your skills, after you confirm. If you delete your
+  copy of a built-in, the built-in is used again. Built-ins themselves can only be switched off.
+- Or just drop a `.md` file into either folder; it shows up on the next turn.
+
+Keep skills short and numbered: small models follow a short checklist much better than prose.
 
 ## Settings profiles
 

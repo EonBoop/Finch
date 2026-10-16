@@ -41,7 +41,7 @@ COMMANDS = {
     "/resume": "resume a session: /resume [number|id]",
     "/cd": "change working directory: /cd path",
     "/tools": "toggle tools (interactive), /tools list, or /tools run_bash off",
-    "/skills": "toggle skills (interactive), /skills list, or /skills bug_fix off",
+    "/skills": "toggle skills (interactive) · list · bug_fix off · new [name] · import <file> · edit [name] · rm [name]",
     "/memory": "show long-term memory",
     "/offline": "toggle offline mode (web tools not assembled)",
     "/unsafe": "toggle the behaviour-tiering safety ring (ring 2)",
@@ -50,6 +50,9 @@ COMMANDS = {
     "/init": "create FINCH.md project notes (injected into the system prompt)",
     "/exit": "quit",
 }
+
+SKILL_ACTIONS = {"new": "create", "create": "create", "add": "create", "import": "import", "edit": "edit",
+                 "rm": "delete", "delete": "delete"}
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 
@@ -372,7 +375,7 @@ class App:
         self.console.print(t if infos else Text(f"no skills (add .md files to {config.SKILLS_DIR_HOME})", style="dim"))
         n = sum(1 for i in infos if self.s.skill_on(i["name"]))
         self.console.print(Text(f"{n}/{len(infos)} on · toggle: /skills <name> on|off · /skills all on|off · "
-                                f"or use /settings", style="dim"))
+                                f"add: /skills new <name> · /skills import <file> · or use /settings", style="dim"))
 
     # ---------------- sessions ----------------
     def resume(self, which, quiet=False):
@@ -517,6 +520,17 @@ class App:
                 ui.notice(f"not a directory: {p}", "error")
         elif cmd == "/tools":
             self.toggle_command(arg, "tool", "Tools", self.show_tools, self.tool_keys(), s.set_tool)
+        elif cmd == "/skills" and arg.split()[:1] and arg.split()[0] in SKILL_ACTIONS:
+            from .settings_menu import run_skill_action
+            a = arg.split(None, 1)
+            try:
+                msg = run_skill_action(self, SKILL_ACTIONS[a[0]], a[1].strip() if len(a) > 1 else None)
+                head, _, path = msg.partition("\n")
+                ui.notice(head or "cancelled", "info" if head in ("", "cancelled", "kept") else "ok")
+                if path:
+                    self.console.print(Text("    " + path, style="dim"))
+            except (ValueError, OSError) as e:
+                ui.notice(str(e), "error")
         elif cmd == "/skills":
             self.toggle_command(arg, "skill", "Skills", self.show_skills,
                                 [i["name"] for i in T.skill_infos(self.tb.workdir)], s.set_skill)

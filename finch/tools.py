@@ -448,6 +448,79 @@ def load_skill(name, workdir, off=()):
     return f"[skill '{name}' {why}. Available:\n{list_skills(workdir, off)}]"
 
 
+SKILL_TEMPLATE = """---
+name: {name}
+description: {desc}
+---
+# {title}
+1. <First step: what to read, run or check.>
+2. <Next step. Keep steps short and concrete: small models follow numbered lists best.>
+3. Verify: <how to check the result before calling finish.>
+"""
+
+
+def skill_dir(workdir=None, project=False):
+    return os.path.join(workdir, ".finch", "skills") if project and workdir else config.SKILLS_DIR_HOME
+
+
+def skill_slug(name):
+    return re.sub(r"[^\w.-]+", "_", str(name).strip()).strip("_.-")
+
+
+def create_skill(name, desc="", workdir=None, project=False, body=None):
+    """Write a new skill (template unless body is given). Returns (name, path); raises ValueError if it exists."""
+    n = skill_slug(name)
+    if not n:
+        raise ValueError("a skill needs a name (letters, digits, _ . -)")
+    base = skill_dir(workdir, project)
+    path = os.path.join(base, n + ".md")
+    if os.path.exists(path) or os.path.exists(os.path.join(base, n + ".txt")):
+        raise ValueError(f"skill '{n}' already exists (/skills edit {n})")
+    os.makedirs(base, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body if body is not None else
+                SKILL_TEMPLATE.format(name=n, desc=desc or "my custom skill", title=n.replace("_", " ").capitalize()))
+    return n, path
+
+
+def import_skill(src, workdir=None, project=False, name=None):
+    """Copy an existing .md/.txt file in as a skill. Returns (name, path)."""
+    src = os.path.abspath(os.path.expanduser(str(src)))
+    if not os.path.isfile(src):
+        raise ValueError(f"no such file: {src}")
+    n = name or os.path.splitext(os.path.basename(src))[0]
+    m = re.search(r"^name:\s*(.+)$", read_text(src)[:600], re.M)
+    if not name and m and os.path.basename(src).upper() == "SKILL.MD":   # Claude-style <dir>/SKILL.md
+        n = m.group(1).strip().strip("\"'")
+    return create_skill(n, workdir=workdir, project=project, body=read_text(src))
+
+
+def editable_skill(name, workdir):
+    """Path to edit for a skill: built-ins are copied to the user dir first (the copy overrides by name)."""
+    info = next((i for i in skill_infos(workdir) if i["name"] == name), None)
+    if not info:
+        raise ValueError(f"no skill named '{name}'")
+    if info["scope"] != "built-in":
+        return info["path"]
+    os.makedirs(config.SKILLS_DIR_HOME, exist_ok=True)
+    dst = os.path.join(config.SKILLS_DIR_HOME, os.path.basename(info["path"]))
+    if not os.path.exists(dst):
+        shutil.copyfile(info["path"], dst)
+    return dst
+
+
+def delete_skill(name, workdir):
+    """Delete a project or user skill (built-ins can only be switched off). Returns (path, scope now used or None)."""
+    info = next((i for i in skill_infos(workdir) if i["name"] == name), None)
+    if not info:
+        raise ValueError(f"no skill named '{name}'")
+    if info["scope"] == "built-in":
+        raise ValueError(f"'{name}' is built-in: switch it off instead (/skills {name} off)")
+    os.remove(info["path"])
+    left = next((i for i in skill_infos(workdir) if i["name"] == name), None)
+    return info["path"], left["scope"] if left else None
+
+
 # ---- web ----
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 

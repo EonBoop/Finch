@@ -444,4 +444,31 @@ skills exist, so using one took `skills(action=list)` then `skills(action=load)`
   call, tests pass (5m25s); `FINCH_ABLATION=skill_index` → `Skill(list)` and never loaded one, tests pass (4m33s).
   One run each, so the time difference is noise; the behaviour difference is the point. pty: "Inline skill index ● on".
 - Pre-existing failure, not touched: `test_custom_system_prompt_modes` expects the prompt to start "You are Finch";
-  it now starts "You are an autonomous agent…".
+  it now starts "You are an autonomous agent…". (Fixed in "Follow-up: custom skills".)
+
+
+## Follow-up: custom skills
+
+Skills already loaded from `.finch/skills/` and `~/.finch/skills/`, but the only way to add one was to create
+the file by hand. Now they can be managed from the REPL as well, the same way souls are.
+
+- `tools.py`: `create_skill` (template, or a given body; refuses an existing name), `import_skill` (copies a
+  `.md`/`.txt` file; a `SKILL.md` takes its frontmatter `name`, so Claude-style skill dirs import cleanly),
+  `editable_skill` (built-ins are copied to the user dir first; the copy overrides by name, as with souls),
+  `delete_skill` (project/user only; reports when a lower-priority skill of the same name takes over).
+- `settings_menu.py`: Skills tab rows *Create / Import / Edit / Delete…* → `skill_request` → `skill_action` in the
+  `run()` loop (sub-dialogs can't run inside the Application). `run_skill_action` raises on errors, so `/skills`
+  can show them as errors; `skill_action` converts them to the flash line. Messages are "status\npath": the CLI
+  prints the path on a dim line (notices stay short), the flash joins them with " · ". `open_in_editor` is
+  shared with `edit_soul`.
+- `cli.py`: `/skills new|create|add [name]`, `import <file>`, `edit [name]`, `rm|delete [name]` (`SKILL_ACTIONS`);
+  with no name, edit/rm open a picker. Everything else still goes to `toggle_command`.
+- No new trick: this is UI only, and the agent's behaviour is unchanged.
+- Verified: pty walkthrough of the tab (create → template written, editor opened, listed under "User") and every
+  `/skills` subcommand, including the duplicate-name error, which is now raised before asking for the description.
+  gemma4:12b, headless "write today's standup" with a custom `standup` skill: loaded `SKILL: standup` and wrote
+  STANDUP.md with exactly the three headings from the skill (209 s).
+- Tests: `test_create_import_edit_delete_skills`, `test_skill_actions_in_settings_and_cli` (196 total, all pass).
+- `test_custom_system_prompt_modes` fixed: in append mode it now checks that the prompt starts with the first line
+  of the built-in prompt (task and chat) instead of the hardcoded "You are Finch", so rewording the prompt
+  doesn't break it.

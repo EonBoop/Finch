@@ -51,6 +51,7 @@ class SettingsMenu:
         self.cursor = {i: 0 for i in range(len(TABS))}
         self.edit_request = None
         self.soul_request = None
+        self.skill_request = None
         self.sched_request = None
         self.prof_request = None
         self.flash = ""
@@ -224,7 +225,17 @@ class SettingsMenu:
                Item("_all_on", "Enable all skills", "action", lambda: None, lambda v: self._all_skills(True),
                     desc="Every skill can be listed and loaded (default)."),
                Item("_all_off", "Disable all skills", "action", lambda: None, lambda v: self._all_skills(False),
-                    desc="The skills tool is dropped from the prompt entirely (a smaller prompt).")]
+                    desc="The skills tool is dropped from the prompt entirely (a smaller prompt)."),
+               Item("_skill_new", "Create a new skill…", "action", lambda: None, lambda v: self._skill_req("create"),
+                    desc=f"Name it and describe it in one line; Finch writes a template to {config.SKILLS_DIR_HOME} "
+                         "(or the project's .finch/skills) and opens it in your editor."),
+               Item("_skill_import", "Import a skill file…", "action", lambda: None, lambda v: self._skill_req("import"),
+                    desc="Copy an existing .md or .txt file (e.g. a Claude-style SKILL.md) in as a skill."),
+               Item("_skill_edit", "Edit a skill…", "action", lambda: None, lambda v: self._skill_req("edit"),
+                    desc="Open a skill in $VISUAL / $EDITOR. Built-in skills are copied to "
+                         f"{config.SKILLS_DIR_HOME} first, and the copy is used from then on."),
+               Item("_skill_delete", "Delete a skill…", "action", lambda: None, lambda v: self._skill_req("delete"),
+                    desc="Delete one of your project or user skills. Built-ins can only be switched off.")]
         infos = T.skill_infos(self.app.tb.workdir)
         if not infos:
             out.append(Item("_h_none", f"No skills found (add .md files to {config.SKILLS_DIR_HOME})", "header",
@@ -365,6 +376,10 @@ class SettingsMenu:
     def _sched_req(self, kind, jid=None):
         self.sched_request = (kind, jid)
         self.application.exit(result="sched")
+
+    def _skill_req(self, kind):
+        self.skill_request = kind
+        self.application.exit(result="skill")
 
     def _soul_req(self, kind):
         self.soul_request = kind
@@ -623,6 +638,9 @@ class SettingsMenu:
             if res == "soul":
                 self._handle_soul_request()
                 continue
+            if res == "skill":
+                self.flash = skill_action(self.app, self.skill_request)
+                continue
             if res == "sysprompt":
                 self.flash = edit_system_prompt(self.app)
                 continue
@@ -684,11 +702,92 @@ def edit_soul(app, name):
             with open(path, encoding="utf-8") as src, open(dst, "w", encoding="utf-8") as out:
                 out.write(src.read())
         path = dst
+    return open_in_editor(path)
+
+
+def open_in_editor(path):
+    """Open a file in the user's editor. Returns a status message."""
     ed = souls.editor_cmd()
     if not ed:
         return f"no editor found (set $EDITOR). Edit the file directly: {path}"
     subprocess.call(ed + [path])
     return f"saved {path}"
+
+
+def _pick_skill(app, title, scopes=("project", "user", "built-in")):
+    infos = [i for i in T.skill_infos(app.tb.workdir) if i["scope"] in scopes]
+    if not infos:
+        return None
+    return choose(app, title, [(i["name"], f"{i['name']:<18} {i['scope']:<9} {i['desc'][:60]}") for i in infos]
+                  + [(None, "Back")])
+
+
+def _pick_scope(app):
+    return choose(app, "Where should the skill live?",
+                  [("user", f"Your skills ({config.SKILLS_DIR_HOME}): every project"),
+                   ("project", f"This project ({os.path.join(app.tb.workdir, '.finch', 'skills')})")])
+
+
+def skill_action(app, kind, name=None):
+    """Skills tab: run_skill_action with errors turned into the status message."""
+    try:
+        return run_skill_action(app, kind, name).replace("\n", " · ")
+    except (ValueError, OSError) as e:
+        return str(e)
+
+
+def _edited(done, path):
+    if not souls.editor_cmd():
+        return f"{done.split(' saved')[0]}: no editor found, set $EDITOR or edit the file\n{path}"
+    open_in_editor(path)
+    return f"{done}\n{path}"
+
+
+def run_skill_action(app, kind, name=None):
+    """Create / import / edit / delete a skill. Returns "status[\npath]"; raises ValueError/OSError on failure."""
+    wd = app.tb.workdir
+    try:
+        if kind == "create":
+            name = name or _ask(app, "Skill name (letters, digits, _ . -)")
+            if not name:
+                return "cancelled"
+            n = T.skill_slug(name)
+            if any(i["name"] == n and i["scope"] != "built-in" for i in T.skill_infos(wd)):
+                raise ValueError(f"skill '{n}' already exists (/skills edit {n})")
+            desc = _ask(app, "One-line description (the model picks skills by it)")
+            scope = _pick_scope(app)
+            if not scope:
+                return "cancelled"
+            name, path = T.create_skill(name, desc, wd, project=scope == "project")
+            return _edited(f"skill '{name}' added", path)
+        if kind == "import":
+            src = name or _ask(app, "Path to a .md or .txt file")
+            if not src:
+                return "cancelled"
+            scope = _pick_scope(app)
+            if not scope:
+                return "cancelled"
+            name, path = T.import_skill(src, wd, project=scope == "project")
+            return f"skill '{name}' added\n{path}"
+        if kind == "edit":
+            name = name or _pick_skill(app, "Edit which skill?")
+            if not name:
+                return "cancelled"
+            path = T.editable_skill(name, wd)
+            return _edited(f"skill '{name}' saved", path)
+        if kind == "delete":
+            name = name or _pick_skill(app, "Delete which skill?", ("project", "user"))
+            if not name:
+                if not any(i["scope"] != "built-in" for i in T.skill_infos(wd)):
+                    raise ValueError("no custom skills to delete (built-ins can only be switched off)")
+                return "cancelled"
+            if choose(app, f"Delete skill '{name}'?", [("no", "Keep it"), ("yes", f"Delete '{name}'")]) != "yes":
+                return "kept"
+            path, left = T.delete_skill(name, wd)
+            return f"deleted skill '{name}'" + (f" (the {left} one is used again)" if left else "") + f"\n{path}"
+    except (EOFError, KeyboardInterrupt):
+        return "cancelled"
+    return ""
 
 
 def edit_system_prompt(app):

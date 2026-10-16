@@ -501,11 +501,12 @@ def test_custom_system_prompt_modes(tmp_path):
     a.s.system_prompt = "Always cite {workdir}. {not_a_var}"
     a.s.system_prompt_mode = "builtin"
     assert "Always cite" not in a.system_prompt(False)            # text kept but unused
+    builtin = {qa: a.system_prompt(qa) for qa in (False, True)}
     a.s.system_prompt_mode = "append"
     for qa in (False, True):
         p = a.system_prompt(qa)
         assert "# Custom instructions\nAlways cite " + str(tmp_path) + ". {not_a_var}" in p
-        assert p.startswith("You are Finch")
+        assert p.startswith(builtin[qa].splitlines()[0])             # built-in prompt first, yours after
     a.s.system_prompt_mode = "replace"
     assert a.system_prompt(False).startswith("Always cite " + str(tmp_path))
     assert "JUDGE INTENT" not in a.system_prompt(False)
@@ -1416,3 +1417,58 @@ def test_skill_index_caps_long_catalogs(tmp_path, skills_home):
     desc = T.skills_def(str(tmp_path))["function"]["description"]
     extra = len(T.skill_infos(str(tmp_path))) - T.SKILL_INDEX_MAX
     assert desc.count("; ") == T.SKILL_INDEX_MAX and desc.endswith(f"+{extra} more (action=list)")
+
+
+def test_create_import_edit_delete_skills(tmp_path, skills_home):
+    wd = str(tmp_path)
+    name, path = T.create_skill("my deploy", "ship it safely", wd)
+    assert name == "my_deploy" and path == os.path.join(skills_home, "my_deploy.md")
+    info = {i["name"]: i for i in T.skill_infos(wd)}["my_deploy"]
+    assert info["scope"] == "user" and info["desc"] == "ship it safely"
+    assert "ship it safely" in T.skills_def(wd)["function"]["description"]
+    with pytest.raises(ValueError):
+        T.create_skill("my_deploy", "again", wd)
+    with pytest.raises(ValueError):
+        T.create_skill(" !! ", "", wd)
+    pname, ppath = T.create_skill("local", "project only", wd, project=True)
+    assert ppath == os.path.join(wd, ".finch", "skills", "local.md")
+    # a Claude-style <dir>/SKILL.md is imported under its frontmatter name
+    src = tmp_path / "pdf-tools" / "SKILL.md"
+    src.parent.mkdir()
+    src.write_text("---\nname: pdf-tools\ndescription: work with PDFs\n---\n1. step", encoding="utf-8")
+    iname, ipath = T.import_skill(str(src), wd)
+    assert iname == "pdf-tools" and open(ipath, encoding="utf-8").read().endswith("1. step")
+    with pytest.raises(ValueError):
+        T.import_skill(str(tmp_path / "missing.md"), wd)
+    # editing a built-in copies it to the user dir, which then overrides it
+    epath = T.editable_skill("bug_fix", wd)
+    assert epath == os.path.join(skills_home, "bug_fix.md")
+    assert {i["name"]: i for i in T.skill_infos(wd)}["bug_fix"]["scope"] == "user"
+    assert T.delete_skill("bug_fix", wd) == (epath, "built-in")
+    with pytest.raises(ValueError):
+        T.delete_skill("bug_fix", wd)          # built-ins can only be switched off
+    T.delete_skill("my_deploy", wd)
+    assert "my_deploy" not in {i["name"] for i in T.skill_infos(wd)}
+
+
+def test_skill_actions_in_settings_and_cli(tmp_path, skills_home, monkeypatch):
+    from types import SimpleNamespace
+    from finch import settings_menu as SM
+    s = settings()
+    app = SimpleNamespace(s=s, tb=box(tmp_path), backend=SimpleNamespace(list_models=lambda: []),
+                          mcp=SimpleNamespace(config=lambda: {}))
+    m = SM.SettingsMenu(app)
+    m.tab = SM.SKILLS
+    assert {"_skill_new", "_skill_import", "_skill_edit", "_skill_delete"} <= {it.key for it in m.items()}
+    opened = []
+    monkeypatch.setattr(SM, "open_in_editor", lambda p: opened.append(p) or f"saved {p}")
+    monkeypatch.setattr(SM, "_ask", lambda app, label, **kw: "triage the inbox")
+    monkeypatch.setattr(SM, "choose", lambda app, title, opts, **kw: opts[0][0])     # user dir / "no"
+    assert "skill 'inbox' added" in SM.skill_action(app, "create", "inbox")
+    assert opened == [os.path.join(skills_home, "inbox.md")]
+    assert "already exists" in SM.skill_action(app, "create", "inbox") and len(opened) == 1
+    assert SM.skill_action(app, "delete", "inbox") == "kept"
+    monkeypatch.setattr(SM, "choose", lambda app, title, opts, **kw: "yes")
+    assert SM.skill_action(app, "delete", "inbox").startswith("deleted skill 'inbox' ·")
+    with pytest.raises(ValueError):
+        SM.run_skill_action(app, "delete")     # nothing custom left to delete
