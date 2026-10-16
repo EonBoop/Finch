@@ -104,7 +104,7 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 
 | Small models can't… | Finch does it for them | Where |
 |---|---|---|
-| …fit all tools in context | **Flat prefill**: 9 core tools with minimal schemas (no per-param descriptions); categories (file/code/web/memory/mcp) loaded by keyword routing; advanced tools via `enable_tools`; skills listed by name only and loaded on demand. A known tool that isn't loaded is loaded on the fly instead of refused. | `heuristics.route_categories`, `agent.tool_surface` |
+| …fit all tools in context | **Flat prefill**: 9 core tools with minimal schemas (no per-param descriptions); categories (file/code/web/memory/mcp) loaded by keyword routing; advanced tools via `enable_tools`; skills listed inline (name + one line) in the `skills` tool, so one call loads the right one (**inline skill index**; off = list first, then load). A known tool that isn't loaded is loaded on the fly instead of refused. | `heuristics.route_categories`, `agent.tool_surface` |
 | …tell chit-chat from work | **Q&A/task layering**: questions get a chat system prompt and read-only tools, answer once and stop; write/run calls are blocked in chat mode. Short follow-ups continue an in-progress task. | `heuristics.is_qa`, `agent._loop` |
 | …escape tool loops | **Signature-level anti-loop ladder**: identical consecutive call is blocked (3×); 5-in-a-row nudge; 8 in a row with 4 identical → tool disabled; calling a disabled tool: nudge at 3, **context hard reset** at 10. Research guard counts only *repeated identical* queries. Todo guard. Per-tool failure ladder: 3 fails → strategy hint (edit_file → disabled, rewrite with create_file). | `agent._loop` |
 | …stop circling on one file | **Shotgun-edit guard**: 4 successful edits of the same file without convergence → "find the root cause first" (2 hints max, never disables). | `heuristics.EditConvergenceGuard` |
@@ -218,7 +218,7 @@ status bar shows the next or running job.
 
 ## Toggleable tricks
 
-Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 36 of them in 7 groups) that
+Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 37 of them in 7 groups) that
 can be switched off. Use the Tricks tab in `/settings`, `/tricks <key> off`, `"tricks": {"crawl_guard": false}`
 in config.json, or `FINCH_ABLATION=key1,key2` (Mingbird's ablation names `finish_gate`, `anti_loop` and
 `flat_prefill` are accepted as aliases). "Disable all tricks" gives you a plain agent loop for comparison.

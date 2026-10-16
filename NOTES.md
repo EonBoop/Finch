@@ -426,3 +426,22 @@ oversized call and timed out again.
   ignored the nudge 4 times, then wrote 74 lines + append_file (294 s). With escalation it switched after one stall
   each time: 55 lines + append_file, 136-line snake.py compiles (175 s). pty: "Stall timeout ‹ 900s ›" on General.
 
+
+## Follow-up: inline skill index
+
+Question: would `list_tools` / `list_skills` menus help a small model? Mostly no: every extra turn is 20–90 s on
+gemma4:12b and another chance to derail, and tools already avoid it (`enable_tools` names the advanced tools in its
+own description, `auto_enable` loads a known tool on call). Skills were the exception: the `skills` tool only said
+skills exist, so using one took `skills(action=list)` then `skills(action=load)`.
+
+- Trick `skill_index` (Prompt & routing): `tools.skills_def` writes each enabled skill as `name (description)` into
+  the `skills` tool description, capped at `SKILL_INDEX_MAX` (12) with "+N more (action=list)". `name` is the only
+  required argument; `skills(name=x)` loads without an `action` (also with the trick off). About +90 tokens of prefill
+  with the 6 built-in skills. Off: the old list/load tool.
+- If MCP catalogs grow past what fits inline, the next step is a `search_tools(query)` returning the top few matches,
+  not a full listing.
+- Verified live, gemma4:12b, "tests in test_stats.py fail, use a skill if one fits": on → `Skill(load bug_fix)` in one
+  call, tests pass (5m25s); `FINCH_ABLATION=skill_index` → `Skill(list)` and never loaded one, tests pass (4m33s).
+  One run each, so the time difference is noise; the behaviour difference is the point. pty: "Inline skill index ● on".
+- Pre-existing failure, not touched: `test_custom_system_prompt_modes` expects the prompt to start "You are Finch";
+  it now starts "You are an autonomous agent…".

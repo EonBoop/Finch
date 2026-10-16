@@ -13,6 +13,8 @@ TRICKS = [
      "Questions get a chat prompt + read-only tools and answer once. Off = everything is a task."),
     ("auto_enable", "Prompt & routing", "Auto-load known tools",
      "A real tool that isn't loaded gets loaded on the fly instead of refused."),
+    ("skill_index", "Prompt & routing", "Inline skill index",
+     "The skills tool lists each skill's name and one line, so one call loads a skill. Off = list first, then load."),
     ("small_model", "Prompt & routing", "Small-model protocol",
      "For ≤4B models: edit_file off up front, bash output trimmed, shell-vs-python hint."),
     ("timebox_parse", "Prompt & routing", "Timebox from task text",
@@ -102,6 +104,11 @@ DETAILS = {
         "Because of flat prefill, the model sometimes calls a real tool that wasn't sent this turn. Finch loads "
         "that tool and runs the call instead of returning an error. Off: the call is refused, and the model has "
         "to load the tool with enable_tools first, which small models often fail to do.",
+    "skill_index":
+        "Every extra turn costs a small model 20-90 seconds and is another chance to wander off. Finch writes the "
+        "name and one-line description of each enabled skill into the skills tool itself, so the model can load "
+        "the right one in a single call instead of listing them first. Off: the tool only says skills exist, and "
+        "the model has to call skills(action=list) before it can load one.",
     "small_model":
         "Models of 4B parameters or fewer get a lighter protocol: edit_file is off from the start (they rarely "
         "match the exact old text), so they rewrite whole files; long bash output is cut to its tail; and they get "

@@ -427,6 +427,19 @@ def list_skills(workdir, off=()):
     return "\n".join(lines) or "(none)"
 
 
+SKILL_INDEX_MAX = 12
+
+
+def skills_def(workdir, off=()):
+    """skills with the enabled skills listed inline, so one call loads the right one (no list round-trip)."""
+    infos = [i for i in skill_infos(workdir) if i["name"] not in off]
+    rows = [f"{i['name']} ({i['desc'][:80]})" if i["desc"] else i["name"] for i in infos[:SKILL_INDEX_MAX]]
+    more = len(infos) - SKILL_INDEX_MAX
+    tail = f"; +{more} more (action=list)" if more > 0 else ""
+    return _f("skills", "Load a skill's step-by-step instructions by name: " + "; ".join(rows) + tail,
+              {"name": S, "action": {"type": "string", "enum": ["load", "list"]}}, ["name"])
+
+
 def load_skill(name, workdir, off=()):
     info = next((i for i in skill_infos(workdir) if i["name"] == str(name)), None)
     if info and info["name"] not in off:
@@ -919,7 +932,7 @@ class ToolBox:
         return format_todo(self.todo)
 
     def t_skills(self, a):
-        if a.get("action", "list") == "list" or not a.get("name"):
+        if not a.get("name") or a.get("action") == "list":
             return list_skills(self.workdir, self.s.skills_off)
         return load_skill(a["name"], self.workdir, self.s.skills_off)
 

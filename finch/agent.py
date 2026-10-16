@@ -179,6 +179,8 @@ class Agent:
             return T.READ_FILE_OFFICE
         if name == "enable_tools":
             return T.enable_tools_def(self.s)
+        if name == "skills" and self.s.on("skill_index"):
+            return T.skills_def(self.tb.workdir, self.s.skills_off)
         return T.ALL_BUILTIN[name]
 
     def tool_surface(self, qa, cats, extra, disabled):

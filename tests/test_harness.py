@@ -1395,3 +1395,24 @@ def test_settings_profiles_tab(tmp_path):
     assert "model" in next(it for it in m.items() if it.key == "one").desc
     m.tab = SM.GENERAL
     assert next(it for it in m.items() if it.key == "_nav_prof").get() == "1 saved"
+
+
+def test_skill_index_inlines_names_and_loads_in_one_call(tmp_path, skills_home):
+    a, _ = make_agent(tmp_path, [])
+    a.s.set_skill("code_review", False)
+    d = a._tool_def("skills")["function"]
+    assert "bug_fix (Systematic debugging" in d["description"] and "code_review" not in d["description"]
+    assert d["parameters"]["required"] == ["name"]
+    assert a.tb.run("skills", {"name": "bug_fix"}).startswith("### SKILL: bug_fix")
+    assert "test_driven" in a.tb.run("skills", {"action": "list"})
+    a.s.set_trick("skill_index", False)
+    assert a._tool_def("skills") is T.ALL_BUILTIN["skills"]
+
+
+def test_skill_index_caps_long_catalogs(tmp_path, skills_home):
+    for n in range(T.SKILL_INDEX_MAX + 3):
+        with open(os.path.join(skills_home, f"s{n:02d}.md"), "w", encoding="utf-8") as f:
+            f.write("---\ndescription: x\n---\nbody")
+    desc = T.skills_def(str(tmp_path))["function"]["description"]
+    extra = len(T.skill_infos(str(tmp_path))) - T.SKILL_INDEX_MAX
+    assert desc.count("; ") == T.SKILL_INDEX_MAX and desc.endswith(f"+{extra} more (action=list)")
