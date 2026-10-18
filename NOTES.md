@@ -87,7 +87,7 @@ Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `
 - **Defaults:** context is 32K, not 128K. `read_file` reports truncation instead of silently cutting at 6000 chars.
 
 ### Not ported
-Parallel sub-agent dispatch (off by default in Mingbird), voice input, GUI-only features, HTTP MCP transports.
+Parallel sub-agent dispatch (off by default in Mingbird; Finch has serial, model-initiated subagents instead, see "Follow-up: subagents"), voice input, GUI-only features, HTTP MCP transports.
 
 ## 4. Environment facts discovered
 
@@ -267,7 +267,8 @@ Final state: **44/44 tests pass**, and both headless and interactive modes have 
   schedule follow-ups itself; per-job model pinning in the wizard; check whether WSL keeps the daemon alive after the last
   terminal closes (untested; Windows Task Scheduler running `wsl … finch schedule tick` is a possible fallback).
 
-- Port parallel sub-agent dispatch: a sandboxed child process per simple todo item, with fallback to running serially.
+- Parallel sub-agent dispatch: serial `spawn_agent` exists now ("Follow-up: subagents"). Parallel only pays off with
+  `OLLAMA_NUM_PARALLEL>1` or several backends, and needs per-child workdirs or file locking first.
 - Esc-to-interrupt (currently Ctrl+C) and expandable tool output (currently `/verbose`).
 - HTTP/SSE MCP transport.
 - Consider `/think off` as the default for gemma4 on simple tasks; thinking spirals cost minutes.
@@ -472,3 +473,60 @@ the file by hand. Now they can be managed from the REPL as well, the same way so
 - `test_custom_system_prompt_modes` fixed: in append mode it now checks that the prompt starts with the first line
   of the built-in prompt (task and chat) instead of the hardcoded "You are Finch", so rewording the prompt
   doesn't break it.
+
+
+## Follow-up: subagents
+
+Goal: let the agent hand a piece of work to a subagent. For a small model the win is context isolation, not
+speed: a child that reads ten files to answer one question costs the parent a few lines instead of ten tool dumps.
+
+- Tool `spawn_agent(task)` (advanced: `ENABLE_LISTED`, auto-load, and an `agent` routing category for
+  "subagent"/"delegate"/"spawn"). Aliases `subagent`, `delegate`, `spawn_subagent`, `delegate_task`, `run_agent`;
+  arg aliases `prompt`/`description`/`instructions`/`goal`/`subtask` → `task`. In `MUTATING` (blocked in chat mode)
+  and `PRODUCTIVE`; a successful spawn sets `productive`, so the parent's fake-finish gate accepts delegated work.
+- `Agent.spawn` builds an in-process child `Agent(depth=1)` with a fresh `Session(sub=True)` and its own `ToolBox`
+  (own todo, crawl and partial-read state) that shares the parent's settings, backend, `Gate`, MCP and **`Rollback`**,
+  so `/undo` reverts a child's writes. The tool lives on `ToolBox` (`tb.spawner`, set only at depth 0), so
+  `batch_tools`, aliases and `tool_on` all go through the normal `ToolBox.run` path.
+- What the child does differently (all keyed on `self.depth`):
+  - `SUB_RIDER` in its system prompt: do only this task, nobody answers questions, the finish summary is all the
+    parent sees.
+  - `spawn_agent` is not in its tool surface, and `tb.spawner is None` refuses it (one level deep).
+  - It doesn't call `gate.new_turn()`, so the user's "allow for the rest of this turn" grants still apply.
+  - `run_turn` re-raises KeyboardInterrupt/Cancelled after repairing its own transcript. Without that the child
+    swallowed ctrl+c and the parent carried on. `ToolBox.run` re-raises `Cancelled` for the same reason.
+  - The step cap is `Settings.subagent_steps` (40, persisted, General tab) instead of 200.
+  - `SubUI`: `interactive = False` (a "?" reply isn't handed to the user), and it drops `turn_start`, `final` and
+    `status` (the parent's ctx gauge stays the parent's).
+  - `SUB_CONTINUE` replaces `CONTINUE` after a prose reply: "your text goes nowhere, call finish with it". The
+    first live run lost about 50 s to a child that answered in prose three times until repeat-detect cut it off.
+  - The fake-finish gate accepts a short summary once the child has used a real tool (`_sub_reported`).
+    Otherwise a read-and-report subtask ("what does a.txt say") was bounced with "you haven't done any real work".
+- Result to the parent: `[subagent finished (N steps, Ts; files written: …)]` plus the summary (capped at 3000
+  chars). If the child stops (step cap, error ladder), the result is a `[tool error: the subagent stopped …]` with its
+  last message, so the failure ladder sees it as a failure.
+- Limits: `SUB_MAX_PER_TURN` = 6, reset per top-level turn. Serial by design: Ollama on one GPU queues requests
+  anyway, and parallel children would race on the workdir.
+- UI: `TerminalUI.nested()` raises `indent` by 4. `bullet`/`result`/`notice`/the thinking line and both live spinners go
+  through `_pad`/`out`. The `Agent(task…)` header prints at `tool_start` (no spinner, since the child's spinner runs
+  inside it), and `tool_end` closes it with `⎿ subagent finished (…)` and the first summary line (40 lines with
+  `/verbose`). The permission panel stays full-width.
+- Child transcripts: `sessions/subagents/<parent id>-sub-<hex>.json`. `Session.list` only reads top-level `*.json`,
+  so `/resume` doesn't offer them.
+- Q&A routing: "delegate the tests to a subagent" and "use a subagent to put hello in a.txt" were classified as
+  chat. Delegation phrases ("delegate", "spawn a", "subagent to", "use subagents", …) are now `TASK_HINTS`. The
+  bare word isn't, so "what is a subagent?" stays a question. `route_categories` adds the broad default when
+  `agent` is the only category.
+- Not a trick: it's a capability (switchable in the Tools tab like any tool), same reasoning as the tools/skills toggles.
+- Verified: 207 tests (11 new). Live gemma4:12b headless, "one subagent per file to summarise a.txt and b.txt,
+  then write summary.md": two children (5 and 3 steps), summary.md correct, 177 s (that run is where the prose-loop
+  and fake-finish fixes above came from). Live REPL in the pty driver, "delegate: write fib.py + test_fib.py and make
+  the tests pass": the child planned, wrote both files, recovered from this machine's broken system pytest plugin, got
+  green and passed its self-check (11 steps, 135 s). The parent got the one-line result. pty: General shows
+  "Subagent step limit ‹ 40 steps ›", Tools tab lists `spawn_agent` (20/20 on).
+- Observed, not changed: after a successful delegation the parent tends to re-verify the work itself (it re-ran the
+  tests, about 90 s), because its prose "the subagent did it" reply gets the normal `CONTINUE` until it calls finish.
+  It's cautious but it costs time. A possible future trick would accept a prose reply right after a successful spawn
+  whose summary reports verified work.
+- Not verified: Windows (no OS-specific code was added), and ctrl+c during a live child (covered by
+  `test_subagent_interrupt_reaches_the_parent` with a scripted model).

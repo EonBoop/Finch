@@ -16,7 +16,9 @@ TASK_HINTS = ("write ", "create ", "build ", "implement", "fix ", "fix the", "de
               "update ", "change ", "edit ", "run ", "install", "setup", "set up", "scaffold", "test ",
               "save ", "download", "scrape", "translate", "summarize", "summarise", "organize", "organise",
               "deploy", "migrate", "port ", "rewrite", "draft ", "compare ", "benchmark", "step 1",
-              "todo(action", "modify", "move ", "copy ", "count ", "calculate", "parse ", "extract ")
+              "todo(action", "modify", "move ", "copy ", "count ", "calculate", "parse ", "extract ",
+              "delegate", "spawn a", "spawn sub", "subagent to", "subagents to", "sub-agent to", "sub-agents to",
+              "use a subagent", "use subagents", "a subagent for", "subagents for")
 QA_HINTS = ("what is", "what are", "what's", "how do i", "how does", "how do you", "why is", "why does",
             "can you explain", "explain", "tell me about", "who is", "who are", "when was", "where is",
             "hi", "hello", "hey", "thanks", "thank you", "good morning", "who are you", "?")
@@ -76,6 +78,7 @@ CATEGORY_TOOLS = {
     "web": ["web_search", "web_fetch", "web_search_multi"],
     "memory": ["memory_store", "memory_recall"],
     "mcp": ["mcp_call"],
+    "agent": ["spawn_agent"],
 }
 CAT_KEYWORDS = {
     "code": ("code", "program", "script", "run", "bash", "python", "compile", "function", "module", "fix",
@@ -89,6 +92,7 @@ CAT_KEYWORDS = {
             "download", "url", "http", "website", "latest", "current", "docs for", "documentation"),
     "memory": ("remember", "recall", "memory", "last time", "previously", "earlier session"),
     "mcp": ("mcp", "external tool", "plugin", "database"),
+    "agent": ("subagent", "sub-agent", "sub agent", "delegate", "spawn"),
 }
 
 
@@ -98,8 +102,8 @@ def route_categories(text):
     cats = {c for c, kws in CAT_KEYWORDS.items() if any(k in low for k in kws)}
     if "code" in cats:
         cats.add("file")
-    if not cats:
-        cats = {"file", "code", "web"}
+    if not cats - {"agent"}:          # "use a subagent to …" still needs the tools to do the work
+        cats |= {"file", "code", "web"}
     return cats
 
 

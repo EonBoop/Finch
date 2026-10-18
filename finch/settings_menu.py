@@ -115,6 +115,10 @@ class SettingsMenu:
                  lambda v: setattr(s, "stream_timeout", max(60, int(v))), [300, 600, 900, 1800, 3600],
                  "Silence allowed once a reply is streaming. Ollama sends nothing while the model writes a tool "
                  "call, so a big file on a slow model needs minutes.", fmt=lambda v: f"{v}s"),
+            Item("subagent_steps", "Subagent step limit", "int", lambda: s.subagent_steps,
+                 lambda v: setattr(s, "subagent_steps", max(5, int(v))), [20, 40, 60, 100],
+                 "Model calls a spawn_agent subagent gets before it is stopped and its partial work handed "
+                 "back. A top-level task gets 200.", fmt=lambda v: f"{v} steps"),
             Item("mode", "Routing", "choice", lambda: app.agent.force_mode,
                  lambda v: setattr(app.agent, "force_mode", v), [None, "task", "chat"],
                  "Force every message to task or chat mode, or let Q&A layering decide (auto). Not persisted.",

@@ -1,5 +1,6 @@
 """The agent loop. Every mechanism here exists because "small models can't do X, so the
 harness does it for them". See README.md for the map from mechanism to failure mode."""
+import contextlib
 import json
 import os
 import platform
@@ -28,7 +29,16 @@ CHAT_SYSTEM = """You are a local AI assistant talking with the user.
 - When you have answered, stop. Don't repeat yourself or list what you could do.
 Working directory: {workdir}"""
 
+SUB_RIDER = """You are a SUBAGENT: another agent handed you the one task in the user message. Do only that task.
+Nobody can answer questions: decide for yourself. When done, call finish with a summary of what you did and found
+(file names, results, anything left undone). That summary is all the other agent will see."""
+SUB_MAX_PER_TURN = 6        # spawn_agent calls per top-level turn
+SUB_RESULT_CAP = 3000       # chars of a subagent's summary handed back to the parent
+WRITE_TOOLS = ("create_file", "edit_file", "append_file")
+
 CONTINUE = "Continue: keep making real progress with tools, or call finish only when fully verified/answered."
+SUB_CONTINUE = ("[harness] Your text reply goes nowhere: the other agent only receives finish(summary). If that "
+                "was your answer, call finish now with it as the summary. If not, keep working with tools.")
 READ_ONLY_CHAT_TOOLS = ("read_file", "list_dir", "web_search", "web_fetch")
 FAIL_MARKERS = ("[edit failed", "[tool error", "[not found", "[web_search error", "[web_fetch error",
                 "[mcp_call error", "[unknown tool", "no such file", "command not found", "fatal:",
@@ -49,8 +59,9 @@ def is_tool_error(res, name=""):
 
 
 class Session:
-    def __init__(self, workdir, model, sid=None):
+    def __init__(self, workdir, model, sid=None, sub=False):
         self.id = sid or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+        self.sub = sub      # a subagent's transcript: saved under sessions/subagents/, not offered by /resume
         self.workdir = workdir
         self.model = model
         self.messages = []
@@ -61,7 +72,7 @@ class Session:
 
     @property
     def path(self):
-        return os.path.join(config.SESSIONS_DIR, self.id + ".json")
+        return os.path.join(config.SESSIONS_DIR, *(("subagents",) if self.sub else ()), self.id + ".json")
 
     def save(self):
         msgs = []
@@ -119,8 +130,24 @@ class NullUI:
     def final(self, text): pass
 
 
+class SubUI:
+    """A subagent's events go to the parent's UI (nested under its Agent line). The turn header,
+    final answer and context gauge stay the parent's: the parent reports the result."""
+    interactive = False         # nobody answers a subagent's questions: "?" replies get CONTINUE
+
+    def __init__(self, parent):
+        self.p = parent
+
+    def __getattr__(self, name):
+        return getattr(self.p, name)
+
+    def turn_start(self, mode, info): pass
+    def status(self, used, budget): pass
+    def final(self, text): pass
+
+
 class Agent:
-    def __init__(self, settings, backend, toolbox, gate, ui=None, mcp=None):
+    def __init__(self, settings, backend, toolbox, gate, ui=None, mcp=None, depth=0):
         self.s = settings
         self.llm = backend
         self.tb = toolbox
@@ -132,6 +159,10 @@ class Agent:
         self.force_mode = None          # None | "task" | "chat"
         self.last_ctx = 0
         self.cancel = None
+        self.depth = depth              # 0 = the user's agent, 1 = a spawn_agent child
+        self.spawned = 0
+        if depth == 0:
+            toolbox.spawner = self.spawn
 
     # ---------------- prompt assembly ----------------
     def prompt_vars(self):
@@ -167,6 +198,8 @@ class Agent:
             base += "\n\n# Custom instructions\n" + custom
         if self.s.lang_hint == "en":
             base += "\nAlways respond in English."
+        if self.depth and not qa:
+            base += "\n\n" + SUB_RIDER
         soul = souls.load(self.s.soul, wd)
         if soul:
             rider = ("" if qa else " The task rules below still apply: the soul sets voice and "
@@ -197,6 +230,8 @@ class Agent:
                 names.update(H.CATEGORY_TOOLS.get(c, []))
             names.update(n for n in extra if n in T.ALL_BUILTIN)
         names = {n for n in names - disabled if self.s.tool_on(n)}
+        if self.depth:
+            names.discard("spawn_agent")
         if "skills" in names and not any(self.s.skill_on(i["name"]) for i in T.skill_infos(self.tb.workdir)):
             names.discard("skills")
         if offline:
@@ -266,7 +301,9 @@ class Agent:
         """One user message -> agent works until finish / answer / interrupt."""
         sess = self.session
         self.cancel = cancel
-        self.gate.new_turn()
+        if not self.depth:
+            self.gate.new_turn()       # a subagent keeps the user's "allow for this turn" grants
+            self.spawned = 0
         self.tb.todo = sess.todo
         msgs = sess.messages
         if not sess.title:
@@ -303,6 +340,8 @@ class Agent:
             result = self._loop(qa, cats, small, budget_min * 60 if budget_min else 0)
         except (KeyboardInterrupt, Cancelled):
             self._repair_after_interrupt(sess.messages)
+            if self.depth:
+                raise                  # the interrupt is the parent's (and the user's) to handle
             sess.messages.append({"role": "user", "content": "[harness] The user interrupted the previous turn."})
             self.ui.notice("interrupted. Type a message to continue (\"continue\" resumes the task)", "error")
             result = None
@@ -365,7 +404,8 @@ class Agent:
                 + T.workdir_listing(tb.workdir)
                 + "\nContinue from the first unfinished step and use tools right away."}]
 
-        for i in range(200):
+        steps = self.s.subagent_steps if self.depth else 200
+        for i in range(steps):
             msgs = sess.messages
             pending = []
             try:
@@ -641,6 +681,8 @@ class Agent:
                     ui.tool_end(name, args, res, err)
                     if name in ("create_file", "edit_file", "append_file", "run_bash", "run_python") and executed:
                         st["productive"] = True
+                    elif name == "spawn_agent" and executed and not err:
+                        st["productive"] = True
                     elif is_mcp and executed and any(name.split(".", 1)[1].startswith(p) for p in
                                                      ("create", "write", "render", "export", "update", "save", "edit")):
                         st["productive"] = True
@@ -806,7 +848,7 @@ class Agent:
                 if st["repeat"] >= 2:
                     ui.notice("repeated output detected twice → ending the turn", "error")
                     return content
-                msgs.append({"role": "user", "content": CONTINUE})
+                msgs.append({"role": "user", "content": SUB_CONTINUE if self.depth else CONTINUE})
                 continue
             last_text, st["repeat"] = content, 0
             if self._partial_read_nudge(st, pnote):
@@ -820,9 +862,59 @@ class Agent:
             if self.ui.interactive and content.rstrip().endswith("?"):
                 # interactive deviation: the model is asking the human something; let them answer
                 return content
-            msgs.append({"role": "user", "content": CONTINUE})
-        ui.notice("iteration limit reached (200). Session saved; type 'continue' to resume.", "error")
+            msgs.append({"role": "user", "content": SUB_CONTINUE if self.depth else CONTINUE})
+        if self.depth:
+            ui.notice(f"subagent step limit reached ({steps}): handing back what it did", "error")
+        else:
+            ui.notice("iteration limit reached (200). Session saved; type 'continue' to resume.", "error")
         return None
+
+    # ---------------- subagents ----------------
+    def spawn(self, task):
+        """spawn_agent: run one subtask in a child agent with a fresh context and the full harness.
+        Serial and in-process: one local model serves one request at a time anyway, and parallel
+        children would race on the same files. Only the child's summary comes back."""
+        task = task.strip()
+        if not task:
+            return "[tool error: spawn_agent needs task=\"...\": describe the whole subtask]"
+        if self.spawned >= SUB_MAX_PER_TURN:
+            return (f"[tool error: spawn_agent limit reached ({SUB_MAX_PER_TURN} subagents this turn). "
+                    f"Do the rest yourself.]")
+        self.spawned += 1
+        tb = T.ToolBox(self.s, self.gate, self.tb.workdir, mcp=self.mcp)
+        tb.rollback = self.tb.rollback          # one journal: /undo also reverts the subagent's writes
+        child = Agent(self.s, self.llm, tb, self.gate, SubUI(self.ui), self.mcp, depth=self.depth + 1)
+        child.force_mode = "task"
+        child.session = Session(self.tb.workdir, self.session.model,
+                                sid=f"{self.session.id}-sub-{uuid.uuid4().hex[:4]}", sub=True)
+        t0 = time.time()
+        nested = getattr(self.ui, "nested", None)
+        with nested() if nested else contextlib.nullcontext():
+            out = child.run_turn(task, cancel=self.cancel)
+        msgs = child.session.messages
+        steps = sum(1 for m in msgs if m.get("role") == "assistant")
+        files = child.written_files()
+        meta = f"{steps} steps, {time.time() - t0:.0f}s" + (f"; files written: {', '.join(files)}" if files else "")
+        if out is None:
+            last = next((str(m.get("content")) for m in reversed(msgs) if m.get("role") == "assistant"
+                         and not H.semantically_empty(str(m.get("content") or ""))), "")
+            return (f"[tool error: the subagent stopped before finishing ({meta}). Check what it left with "
+                    f"list_dir/read_file and do the rest yourself.]" + (f"\nIts last message:\n{last[:1500]}" if last else ""))
+        out = out.strip() or "(no summary)"
+        if len(out) > SUB_RESULT_CAP:
+            out = out[:SUB_RESULT_CAP] + "…(cut)"
+        return f"[subagent finished ({meta})]\n{out}"
+
+    def written_files(self):
+        """Workdir files this session's write tools touched (that still exist), in order."""
+        seen = []
+        for m in self.session.messages:
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                path = (fn.get("arguments") or {}).get("path") if isinstance(fn.get("arguments"), dict) else None
+                if fn.get("name") in WRITE_TOOLS and path and path not in seen and os.path.isfile(self.tb.p(path)):
+                    seen.append(str(path))
+        return seen
 
     def _enable_tools(self, args, extra, disabled):
         names = args.get("tools") or args.get("names") or []
@@ -881,7 +973,7 @@ class Agent:
         summary = str(args.get("summary", ""))
         # 1. fake finish: no real work and no answer text
         if on("fake_finish_gate") and not st["productive"] and H.semantically_empty(content) and st["fake_finish"] < 2 \
-                and len(summary) < 200 and not self._answered_by_reading():
+                and len(summary) < 200 and not self._answered_by_reading() and not self._sub_reported(summary):
             st["fake_finish"] += 1
             pnote("⚠️ finish rejected: you haven't done any real work yet (no files created/changed, no "
                   "commands run). Pick one:\n1. If the answer/deliverable is decided, write it with create_file, "
@@ -956,6 +1048,12 @@ class Agent:
         floor = 0 if a and d == a else 200
         return any(m.get("role") == "assistant" and not H.semantically_empty(str(m.get("content", "")))
                    and len(str(m.get("content", ""))) > floor for m in self.session.messages[-6:])
+
+    def _sub_reported(self, summary):
+        """A subagent's summary is its delivery: a short one is fine once it actually looked at something."""
+        return bool(self.depth and summary.strip()) and any(
+            m.get("role") == "tool" and m.get("tool_name") not in ("todo", "enable_tools", "skills", "finish")
+            for m in self.session.messages)
 
     def _ws_note(self):
         return (f" Your working directory (absolute) is {self.tb.workdir}; all deliverables go inside it, "

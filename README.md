@@ -239,6 +239,38 @@ An MCP server is switched as a whole (all its `server.tool` tools). A skill that
 `skills list` and can't be loaded; with every skill off the `skills` tool itself leaves the prompt.
 **`finish` can't be turned off**: the finish gates depend on it. The toolbar shows how many tools are off.
 
+## Subagents
+
+The agent can hand a self-contained piece of work to a **subagent** with `spawn_agent(task="…")`. The subagent is a
+fresh agent with an empty context and the full harness (plan, finish gates, test guard, anti-loop ladders,
+compaction). It works in the same directory with the same model, and only its final summary comes back to the
+parent. That keeps the parent's context small: reading ten files for one answer costs the parent a few lines,
+not ten file dumps, which matters on a 32K window.
+
+```
+● Agent(Read a.txt and give a one-sentence summary…)
+    ● Read(a.txt)
+      ⎿  Read 2 lines
+  ⎿  subagent finished (3 steps, 19s)
+     The text describes a fox jumping over a dog and notes that foxes are clever animals.
+```
+
+- Ask for it in the task ("use a subagent to…", "delegate the tests to a subagent") and the tool is loaded up front.
+  Otherwise the model can load it with `enable_tools`, like the other advanced tools.
+- The subagent can't see the conversation, so the parent has to put everything it needs into `task`. It can't ask
+  questions either: nobody answers it, so it decides for itself and reports back.
+- **Limits:** one level deep (a subagent can't start its own), at most 6 per turn, and 40 model calls each
+  ("Subagent step limit" on the General tab, `subagent_steps` in config.json). A subagent that hits the limit is
+  stopped and the parent is told what it got done.
+- **Shared, not separate:** safety confirmations go to you as usual, and an "allow for the rest of this turn"
+  answer covers the subagent too. Its file writes are in the same backup journal, so `/undo` reverts them.
+  ctrl+c stops the subagent and the parent turn together.
+- Subagents run one at a time, not in parallel. A local model serves one request at a time anyway, and parallel
+  subagents would race on the same files.
+- Each subagent's transcript is saved to `~/.finch/sessions/subagents/` (named after the parent session), and
+  `/resume` doesn't list them.
+- Turn it off like any tool: the Tools tab, or `/tools spawn_agent off`.
+
 ## Custom skills
 
 A skill is a markdown file of step-by-step instructions the model loads when a task fits. The model picks
@@ -321,6 +353,6 @@ MCP (`~/.finch/mcp.json`):
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests
 ```
 
-192 tests, no backend needed; they pass on Linux and natively on Windows. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
+207 tests, no backend needed; they pass on Linux and natively on Windows. For the terminal UI itself, `scripts/pty_drive.py` runs the REPL in a pseudo-terminal and
 prints the screen (see its docstring). The suite includes a scripted fake model that drives the full loop through the finish gates, the
 anti-loop ladder, the empty-turn ladder and the chat mode. It doesn't need a running backend.

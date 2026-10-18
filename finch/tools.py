@@ -16,6 +16,7 @@ import tempfile
 import time
 
 from . import config, docs, osutil
+from .llm import Cancelled
 from .safety import safe_path
 
 
@@ -31,7 +32,7 @@ ARR = {"type": "array", "items": {"type": "string"}}
 
 ENABLE_TOOLS_DESC = "Enable advanced tools on demand: "
 ENABLE_LISTED = ("run_python", "append_file", "delete_file", "search_files", "web_search", "web_fetch",
-                 "memory_store", "memory_recall", "mcp_call")
+                 "memory_store", "memory_recall", "mcp_call", "spawn_agent")
 
 CORE_TOOLS = [
     _f("create_file", "Create or overwrite a file. Overwriting an existing larger file requires replace=true",
@@ -64,6 +65,9 @@ ADVANCED_TOOLS = [
     _f("memory_recall", "Retrieve facts from memory relevant to a query", {"query": S, "limit": N}, ["query"]),
     _f("mcp_call", "Call a tool exposed by an MCP server", {"server": S, "tool": S, "args": {"type": "object"}},
        ["server", "tool"]),
+    _f("spawn_agent", "Hand one self-contained subtask to a subagent with a fresh context; it works with tools and "
+       "returns only its summary. It can't see this conversation: put every detail it needs in task",
+       {"task": S}),
 ]
 ALL_BUILTIN = {t["function"]["name"]: t for t in CORE_TOOLS + ADVANCED_TOOLS}
 READ_FILE_OFFICE = copy.deepcopy(ALL_BUILTIN["read_file"])     # advertised only while office_extract is on
@@ -71,14 +75,14 @@ READ_FILE_OFFICE["function"]["description"] = (
     "Read a file's content; also extracts the text of .xlsx/.docx/.pptx/.pdf (spreadsheets as numbered rows, "
     "no libraries needed). Optional start_line/end_line to read a range")
 ONLINE_TOOLS = {"web_search", "web_fetch", "web_search_multi"}
-MUTATING = ("create_file", "edit_file", "append_file", "delete_file", "run_bash", "run_python")
-PRODUCTIVE = ("create_file", "edit_file", "append_file", "run_bash", "run_python", "finish")
+MUTATING = ("create_file", "edit_file", "append_file", "delete_file", "run_bash", "run_python", "spawn_agent")
+PRODUCTIVE = ("create_file", "edit_file", "append_file", "run_bash", "run_python", "spawn_agent", "finish")
 
 REQ_ARGS = {"create_file": ["path", "content"], "read_file": ["path"], "edit_file": ["path", "old", "new"],
             "list_dir": ["path"], "run_bash": ["command"], "run_python": ["code"],
             "append_file": ["path", "content"], "delete_file": ["path"], "todo": ["action"],
             "skills": ["action"], "finish": ["summary"], "search_files": ["path", "pattern"],
-            "web_search": ["query"], "web_fetch": ["url"]}
+            "web_search": ["query"], "web_fetch": ["url"], "spawn_agent": ["task"]}
 
 
 
@@ -109,6 +113,8 @@ ALIASES = {
     "execute_command": "run_bash", "run_command": "run_bash", "exec": "run_bash",
     "python": "run_python", "execute_python": "run_python", "done": "finish", "complete": "finish",
     "task_complete": "finish", "attempt_completion": "finish",
+    "subagent": "spawn_agent", "spawn_subagent": "spawn_agent", "delegate": "spawn_agent",
+    "delegate_task": "spawn_agent", "run_agent": "spawn_agent",
 }
 ARG_ALIASES = {
     "path": ("file_path", "filepath", "filename", "file", "dir", "directory", "target_file"),
@@ -118,6 +124,7 @@ ARG_ALIASES = {
     "command": ("cmd", "script", "bash", "shell"),
     "code": ("script", "source", "python"),
     "summary": ("result", "message", "answer", "text"),
+    "task": ("prompt", "description", "instructions", "goal", "subtask"),
 }
 
 # ---- crawl guard v2 (byte budget; never refuses) ----
@@ -647,6 +654,7 @@ class ToolBox:
         self.todo = []
         self.small_model = False
         self.pending_images = []
+        self.spawner = None     # set by a top-level Agent; None in a subagent (no grandchildren)
 
     def set_workdir(self, workdir):
         self.workdir = os.path.abspath(workdir)
@@ -697,7 +705,7 @@ class ToolBox:
                 ex = ' Correct example: append_file(path="notes.md", content="text to append")'
             return (f"[tool error: {name} is missing argument {e}. Required: {missing}. "
                     f"You passed: {got}.{ex} Retry with the missing argument added, content unchanged.]")
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, Cancelled):     # Cancelled can come out of a subagent
             raise
         except Exception as e:
             return f"[tool error: {type(e).__name__}: {e}]"
@@ -1061,6 +1069,12 @@ class ToolBox:
         if not self.s.tool_on(f"{a['server']}.{a['tool']}"):
             return off_msg(f"MCP server {a['server']}")
         return self.mcp.call(str(a["server"]), str(a["tool"]), a.get("args") or {}, self.workdir)
+
+    def t_spawn_agent(self, a):
+        task = str(a["task"])
+        if self.spawner is None:
+            return "[tool error: spawn_agent: a subagent can't start subagents of its own. Do this part yourself.]"
+        return self.spawner(task)
 
     def t_enable_tools(self, a):
         # handled by the agent (it owns the active tool surface); this is a fallback

@@ -1472,3 +1472,104 @@ def test_skill_actions_in_settings_and_cli(tmp_path, skills_home, monkeypatch):
     assert SM.skill_action(app, "delete", "inbox").startswith("deleted skill 'inbox' ·")
     with pytest.raises(ValueError):
         SM.run_skill_action(app, "delete")     # nothing custom left to delete
+
+
+# ---------------- subagents ----------------
+def test_spawn_agent_runs_child_with_fresh_context(tmp_path):
+    a, llm = make_agent(tmp_path, [
+        ("spawn_agent", {"task": "write hello into a.txt"}),            # parent
+        ("create_file", {"path": "a.txt", "content": "hello"}),        # child
+        ("finish", {"summary": "wrote a.txt"}),                         # child: self-check rejects once
+        ("finish", {"summary": "wrote a.txt"}),
+        ("finish", {"summary": "a subagent wrote a.txt"}),              # parent
+        ("finish", {"summary": "a subagent wrote a.txt"}),
+    ])
+    a.run_turn("use a subagent to put hello in a.txt")
+    assert (tmp_path / "a.txt").read_text() == "hello"
+    child_sys = llm.calls[1][0]["content"]
+    assert "SUBAGENT" in child_sys and "use a subagent" not in str(llm.calls[1])    # child never saw the parent
+    res = next(m["content"] for m in a.session.messages if m.get("tool_name") == "spawn_agent")
+    assert res.startswith("[subagent finished (") and "files written: a.txt" in res and "wrote a.txt" in res
+    assert not any(tc["function"]["name"] == "create_file"                         # parent context stays small
+                   for m in a.session.messages for tc in m.get("tool_calls") or [])
+    subs = os.listdir(os.path.join(config.SESSIONS_DIR, "subagents"))
+    assert len(subs) == 1 and subs[0].startswith(a.session.id + "-sub-")
+    assert all(s["id"] == a.session.id for s in Session.list())                    # not offered by /resume
+    assert a.tb.rollback.undo() == "removed newly created a.txt (moved to .finch/trash)"   # shared journal
+
+
+def test_subagent_cannot_spawn_and_has_no_spawn_tool(tmp_path):
+    s = settings()
+    g = Gate(s)
+    tb = T.ToolBox(s, g, str(tmp_path))
+    child = Agent(s, FakeLLM([]), tb, g, NullUI(), depth=1)
+    assert tb.spawner is None
+    names = {d["function"]["name"] for d in child.tool_surface(False, {"agent", "file"}, {"spawn_agent"}, set())}
+    assert "spawn_agent" not in names and "create_file" in names
+    assert "can't start subagents" in tb.run("spawn_agent", {"task": "x"})
+    assert "can't start subagents" in tb.run("subagent", {"prompt": "x"})          # aliases map too
+
+
+def test_subagent_step_limit_hands_back_partial_work(tmp_path):
+    a, llm = make_agent(tmp_path, [("spawn_agent", {"task": "look around"})]
+                        + [("list_dir", {"path": p}) for p in "abcde"]
+                        + [("create_file", {"path": "o.txt", "content": "x"})], subagent_steps=5)
+    a.run_turn("use a subagent to look around, then write o.txt")
+    res = next(m["content"] for m in a.session.messages if m.get("tool_name") == "spawn_agent")
+    assert res.startswith("[tool error: the subagent stopped before finishing (5 steps")
+    assert (tmp_path / "o.txt").exists()                                            # the parent carried on
+
+
+def test_subagent_interrupt_reaches_the_parent(tmp_path):
+    class Interrupting(FakeLLM):
+        def chat(self, *a, **kw):
+            if len(self.calls) == 1:          # the child's first model call
+                self.calls.append([])
+                raise KeyboardInterrupt
+            return super().chat(*a, **kw)
+    s = settings()
+    g = Gate(s)
+    llm = Interrupting([("spawn_agent", {"task": "write a.txt"})])
+    a = Agent(s, llm, T.ToolBox(s, g, str(tmp_path)), g, NullUI())
+    a.session = Session(str(tmp_path), "fake:12b")
+    assert a.run_turn("use a subagent to write a.txt") is None
+    msgs = a.session.messages
+    assert msgs[-2] == {"role": "tool", "tool_name": "spawn_agent",
+                        "content": "[interrupted by user before this tool ran]"}
+    assert "interrupted" in msgs[-1]["content"]
+
+
+def test_spawn_limit_off_switch_and_routing(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    a.spawned = 6
+    assert "limit reached" in a.spawn("another one")
+    assert "needs task" in a.spawn("  ")
+    assert "spawn_agent" in a.tb.run("spawn_agent", {}) and "missing argument" in a.tb.run("spawn_agent", {})
+    off = box(tmp_path, tools_off=["spawn_agent"])
+    assert "turned off by the user" in off.run("spawn_agent", {"task": "x"})
+    assert "spawn_agent" in T.enable_tools_def(settings())["function"]["description"]
+    assert {"agent", "file", "code", "web"} <= H.route_categories("use a subagent for this")
+    assert H.route_categories("delegate the python tests") >= {"agent", "code", "file"}
+    assert "spawn_agent" in H.CATEGORY_TOOLS["agent"]
+
+
+@pytest.mark.parametrize("text,qa", [
+    ("use a subagent to put hello in a.txt", False), ("delegate the tests to a subagent", False),
+    ("spawn a subagent per module", False), ("what is a subagent?", True), ("how do subagents work", True),
+])
+def test_delegation_requests_are_tasks(text, qa):
+    assert H.is_qa(text) is qa
+
+
+def test_subagent_prose_reply_is_steered_to_finish(tmp_path):
+    a, llm = make_agent(tmp_path, [
+        ("spawn_agent", {"task": "say what a.txt contains"}),
+        ("read_file", {"path": "a.txt"}),
+        "It contains the word hello.",                                     # child answers in prose
+        ("finish", {"summary": "a.txt contains the word hello"}),          # short, but it read the file
+    ])
+    (tmp_path / "a.txt").write_text("hello")
+    a.run_turn("use a subagent to check a.txt and tell me what it says")
+    assert any("only receives finish(summary)" in str(m.get("content")) for m in llm.calls[3])
+    res = next(m["content"] for m in a.session.messages if m.get("tool_name") == "spawn_agent")
+    assert "a.txt contains the word hello" in res

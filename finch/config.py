@@ -75,6 +75,7 @@ class Settings:
     keep_alive: str = "30m"            # keep the model resident through long tool chains
     bash_timeout: int = 120
     stream_timeout: int = 900          # silence allowed in a reply (Ollama sends nothing while a tool call is written)
+    subagent_steps: int = 40           # model calls a spawn_agent child gets before it is stopped
     python: str = ""                   # interpreter for run_python / test guard
     offline: bool = False              # web tools are not even assembled into the prompt
     allow_env_mutation: bool = False
@@ -182,7 +183,7 @@ def load_settings():
 
 
 PERSISTED = ("model", "num_ctx", "num_predict", "think", "offline", "host", "backend", "openai_base_url",
-             "temperature", "keep_alive", "bash_timeout", "stream_timeout", "theme", "soul", "system_prompt", "system_prompt_mode", "tricks", "tools_off", "skills_off",
+             "temperature", "keep_alive", "bash_timeout", "stream_timeout", "subagent_steps", "theme", "soul", "system_prompt", "system_prompt_mode", "tricks", "tools_off", "skills_off",
              "verbose", "lang_hint")
 
 

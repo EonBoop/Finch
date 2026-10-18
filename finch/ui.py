@@ -1,6 +1,7 @@
 """Terminal UI in the style of Claude Code: streamed markdown, ● tool lines with ⎿ results,
 live spinner with elapsed time and token count, permission prompts, a todo checklist,
 slash commands, @file mentions, and a status toolbar."""
+import contextlib
 import difflib
 import json
 import os
@@ -9,6 +10,7 @@ import time
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.table import Table
@@ -25,7 +27,7 @@ TOOL_LABEL = {
     "web_search": "WebSearch", "web_fetch": "Fetch", "web_search_multi": "WebSearch",
     "todo": "Update Todos", "finish": "Finish", "skills": "Skill", "enable_tools": "EnableTools",
     "memory_store": "Remember", "memory_recall": "Recall", "batch_tools": "Batch", "mcp_call": "MCP",
-    "delete_file": "Delete",
+    "delete_file": "Delete", "spawn_agent": "Agent",
 }
 SPIN_WORDS = ("Thinking", "Pondering", "Working", "Reasoning", "Composing", "Considering", "Brewing",
               "Mulling", "Crafting", "Noodling")
@@ -61,6 +63,8 @@ def tool_arg_summary(name, a):
         return f"{a.get('action', 'list')} {a.get('name', '')}".strip()
     if name == "enable_tools":
         return ", ".join(map(str, a.get("tools") or []))
+    if name == "spawn_agent":
+        return short(a.get("task", ""), 80)
     if name == "todo":
         return ""
     if name == "finish":
@@ -77,6 +81,7 @@ class TerminalUI:
         self.set_theme(theme)
         self.verbose = verbose
         self.live = None
+        self.indent = 0         # columns: a subagent's output is nested under its Agent line
         self._reset_stream()
         self.ctx_used = 0
         self.ctx_budget = 0
@@ -115,19 +120,36 @@ class TerminalUI:
     def abort(self):
         self._stop_live()
 
+    @contextlib.contextmanager
+    def nested(self):
+        """Everything printed inside is indented (a subagent's run, under its Agent line)."""
+        self._stop_live()
+        self.indent += 4
+        try:
+            yield
+        finally:
+            self._stop_live()
+            self.indent -= 4
+
+    def _pad(self, renderable):
+        return Padding(renderable, (0, 0, 0, self.indent)) if self.indent else renderable
+
+    def out(self, renderable, **kw):
+        self.c.print(self._pad(renderable), **kw)
+
     def bullet(self, renderable, color="bullet"):
         g = Table.grid(padding=(0, 1))
         g.add_column(width=1, no_wrap=True)
         g.add_column(ratio=1)
         g.add_row(Text(self.g("bullet"), style=color), renderable)
-        self.c.print(g)
+        self.out(g)
 
     def result(self, renderable):
         g = Table.grid(padding=(0, 1))
         g.add_column(width=4, no_wrap=True)
         g.add_column(ratio=1)
         g.add_row(Text(f"  {self.g('result')} ", style="dim"), renderable)
-        self.c.print(g)
+        self.out(g)
 
     # ---------------- streaming ----------------
     def _render_live(self):
@@ -146,7 +168,7 @@ class TerminalUI:
         status = Text.assemble((f"{face}{self.word}… ", "accent"),
                                (f"({elapsed:.0f}s · ↓ {toks} tokens · ctrl+c to interrupt)", "dim"))
         parts.append(Spinner("dots", text=status, style="accent"))
-        return Group(*parts)
+        return self._pad(Group(*parts))
 
     def model_start(self, i):
         self._stop_live()
@@ -169,10 +191,10 @@ class TerminalUI:
         if th:
             dur = self.think_t if self.think_t is not None else time.time() - self.t0
             if self.verbose:
-                self.c.print(Text(f"{self.g('logo')} Thinking ({dur:.1f}s)", style="think"))
-                self.c.print(Text(th, style="think"), soft_wrap=True)
+                self.out(Text(f"{self.g('logo')} Thinking ({dur:.1f}s)", style="think"))
+                self.out(Text(th, style="think"), soft_wrap=True)
             else:
-                self.c.print(Text(f"{self.g('logo')} Thought for {dur:.1f}s", style="think"))
+                self.out(Text(f"{self.g('logo')} Thought for {dur:.1f}s", style="think"))
         if stats.get("error") or stats.get("interrupted"):
             txt = "".join(self.content).strip()
             if txt:
@@ -183,9 +205,9 @@ class TerminalUI:
             self.bullet(Markdown(content))
             self.last_streamed = content
         elif not content and not stats.get("has_tools") and not th:
-            self.c.print(Text("  (empty response)", style="dim"))
+            self.out(Text("  (empty response)", style="dim"))
         if stats.get("done_reason") == "length":
-            self.c.print(Text("  ⚠ output hit the token cap", style="warn"))
+            self.out(Text("  ⚠ output hit the token cap", style="warn"))
 
     # ---------------- tools ----------------
     def tool_start(self, name, args):
@@ -195,9 +217,11 @@ class TerminalUI:
         line = Text.assemble((label, "tool"), (f"({summ})" if summ else "", ""))
         self._tool_line = line
         self._tool_t0 = time.time()
-        if name not in ("todo", "finish", "enable_tools", "skills"):
-            self.live = Live(Spinner("dots", text=Text.assemble(line, ("  running…", "dim")), style="accent"),
-                             console=self.c, refresh_per_second=10, transient=True)
+        if name == "spawn_agent":
+            self.bullet(line, "accent")      # header first: the subagent's own output follows, nested
+        elif name not in ("todo", "finish", "enable_tools", "skills"):
+            self.live = Live(self._pad(Spinner("dots", text=Text.assemble(line, ("  running…", "dim")),
+                                               style="accent")), console=self.c, refresh_per_second=10, transient=True)
             self.live.start()
 
     def tool_end(self, name, args, result, error):
@@ -210,6 +234,9 @@ class TerminalUI:
             return
         if name == "todo":
             return
+        if name == "spawn_agent":
+            self._agent_result(res, error)
+            return
         color = "err" if error and not blocked else ("warn" if blocked else "ok")
         dur = time.time() - getattr(self, "_tool_t0", time.time())
         line = self._tool_line.copy()
@@ -217,6 +244,18 @@ class TerminalUI:
             line.append(f"  {dur:.0f}s", style="dim")
         self.bullet(line, color)
         self.result(self._result_view(name, args, res, error))
+
+    def _agent_result(self, res, error):
+        """The Agent header was printed at the start; close it with how it went."""
+        lines = res.splitlines() or [""]
+        head = lines[0].strip("[]")
+        if head.startswith("tool error: "):
+            head = head[len("tool error: "):]
+        t = Text(short(head, 200), style="err" if error else "ok")
+        body = [ln for ln in lines[1:] if ln.strip()]
+        if body:
+            t.append("\n" + ("\n".join(body[:40]) if self.verbose else short(body[0], 160)), style="dim")
+        self.result(t)
 
     def _result_view(self, name, args, res, error):
         lines = res.splitlines() or [""]
@@ -348,7 +387,7 @@ class TerminalUI:
         text = text.lstrip("⚠️⏱ \ufe0f").split("\n")[0]
         if len(text) > 160:
             text = text[:text.find(":", 0, 160) + 1 or 157].rstrip(":") + "…"
-        self.c.print(Text(f"  {icon} {text}", style=style))
+        self.out(Text(f"  {icon} {text}", style=style))
 
     def status(self, used, budget):
         self.ctx_used, self.ctx_budget = used, budget
@@ -394,6 +433,8 @@ class PlainUI(TerminalUI):
         summ = tool_arg_summary(name, args)
         self._tool_line = Text.assemble((label, "tool"), (f"({summ})" if summ else "", ""))
         self._tool_t0 = time.time()
+        if name == "spawn_agent":
+            self.bullet(self._tool_line, "accent")
 
     def confirm(self, tool, target, action):
         return "no"

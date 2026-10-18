@@ -1,0 +1,87 @@
+{
+  "scan_timestamp": "2026-10-16T01:38:22.218117",
+  "hostname": "SpeedyFriend",
+  "total_devices": 7,
+  "devices": [
+    {
+      "ip": "10.0.0.1",
+      "mac": "a4:01:de:c7:52:37",
+      "role": "Gateway / Router",
+      "os": "Linux-based firmware (ASUSTOR TP-Link platform)",
+      "confidence": "HIGH",
+      "open_ports": {
+        "53": "DNS",
+        "80": "HTTP",
+        "443": "HTTPS"
+      },
+      "gateway": true,
+      "container_name": ""
+    },
+    {
+      "ip": "10.0.0.115",
+      "mac": "d6:79:e7:50:d0:c4",
+      "role": "WSL Host (SpeedyFriend)",
+      "os": "Linux (WSL2 - Ubuntu/Debian distribution)",
+      "confidence": "VERY HIGH",
+      "open_ports": {},
+      "gateway": false,
+      "container_name": ""
+    },
+    {
+      "ip": "10.255.255.254",
+      "mac": "d6:79:e7:50:d0:c4",
+      "role": "WSL DNS Resolver",
+      "os": "Linux (systemd-resolved stub listener)",
+      "confidence": "HIGH",
+      "open_ports": {
+        "53": "DNS"
+      },
+      "gateway": true,
+      "container_name": ""
+    },
+    {
+      "ip": "127.0.0.53",
+      "mac": "",
+      "role": "Local Loopback DNS",
+      "os": "Linux (systemd-resolved stub)",
+      "confidence": "HIGH",
+      "open_ports": {
+        "53": "DNS"
+      },
+      "gateway": false,
+      "container_name": ""
+    },
+    {
+      "ip": "169.254.73.249",
+      "mac": "00:11:22:33:44:55",
+      "role": "Link-Local Device",
+      "os": "Generic/Unknown (possibly Windows IoT or embedded device)",
+      "confidence": "MEDIUM",
+      "open_ports": {},
+      "gateway": false,
+      "container_name": ""
+    },
+    {
+      "ip": "172.17.0.1",
+      "mac": "",
+      "role": "Docker Bridge Gateway",
+      "os": "Linux (Docker containerd/runtime host)",
+      "confidence": "HIGH",
+      "open_ports": {},
+      "gateway": true,
+      "container_name": ""
+    },
+    {
+      "ip": "172.18.0.2",
+      "mac": "1a:ef:98:29:91:23",
+      "role": "Docker Container (dsh-harness)",
+      "os": "Linux (Debian-based Docker container)",
+      "confidence": "HIGH",
+      "open_ports": {
+        "3081": "DCOS/UI"
+      },
+      "gateway": false,
+      "container_name": "dsh-harness"
+    }
+  ]
+}
