@@ -378,6 +378,8 @@ class TerminalUI:
                 bits.append("small-model protocol (edit_file off, slim outputs)")
             if info.get("timebox"):
                 bits.append(f"timebox {info['timebox']:.0f} min")
+            if info.get("skills"):
+                bits.append("skill: " + ", ".join(info["skills"]))
         self.c.print(Text("  " + " · ".join(bits), style="dim"))
 
     def notice(self, text, level="warn"):

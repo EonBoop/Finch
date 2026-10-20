@@ -104,21 +104,21 @@ Scheduled jobs from the shell: `finch schedule add|list|run|pause|resume|rm|log|
 
 | Small models can't… | Finch does it for them | Where |
 |---|---|---|
-| …fit all tools in context | **Flat prefill**: 9 core tools with minimal schemas (no per-param descriptions); categories (file/code/web/memory/mcp) loaded by keyword routing; advanced tools via `enable_tools`; skills listed inline (name + one line) in the `skills` tool, so one call loads the right one (**inline skill index**; off = list first, then load). A known tool that isn't loaded is loaded on the fly instead of refused. | `heuristics.route_categories`, `agent.tool_surface` |
+| …fit all tools in context | **Flat prefill**: 9 core tools with minimal schemas (no per-param descriptions); categories (file/code/web/memory/mcp) loaded by keyword routing; advanced tools via `enable_tools`; skills listed inline (name + one line) in the `skills` tool, so one call loads the right one (**inline skill index**; off = list first, then load), and the task prompt says to load a fitting skill before planning (**skill-first rule**). A skill can also be **preloaded**: one with `preload: agent` is added to the task when routing picks that category, so "use subagents…" starts with the `delegate` steps. A known tool that isn't loaded is loaded on the fly instead of refused. | `heuristics.route_categories`, `agent.tool_surface` |
 | …tell chit-chat from work | **Q&A/task layering**: questions get a chat system prompt and read-only tools, answer once and stop; write/run calls are blocked in chat mode. Short follow-ups continue an in-progress task. | `heuristics.is_qa`, `agent._loop` |
 | …escape tool loops | **Signature-level anti-loop ladder**: identical consecutive call is blocked (3×); 5-in-a-row nudge; 8 in a row with 4 identical → tool disabled; calling a disabled tool: nudge at 3, **context hard reset** at 10. Research guard counts only *repeated identical* queries. Todo guard. Per-tool failure ladder: 3 fails → strategy hint (edit_file → disabled, rewrite with create_file). | `agent._loop` |
 | …stop circling on one file | **Shotgun-edit guard**: 4 successful edits of the same file without convergence → "find the root cause first" (2 hints max, never disables). | `heuristics.EditConvergenceGuard` |
 | …recover from empty output | **Empty-turn ladder**: nudge at 3, hard reset to task + plan + file listing at 6 (max 3 resets), then graceful exit. Unclosed `<think>` counts as empty. Truncation at the token cap gets **"skeleton then append"** chunking feedback. A reply that **stalls** (no data for `stream_timeout`, usually one huge tool call) gets "write it in pieces" feedback, stricter each time, instead of an identical retry. | `agent._loop` |
-| …emit valid tool calls | **Format-leak salvage**: JSON in text, ```json fences, `<tool_call>` tags, gemma `call:name{…}`, placeholder quotes `<\|"\|>`, bare `finish(summary="x")`. Tool-name aliases (`write_file`, `bash`, …) and argument aliases (`file_path`, `cmd`, …). Missing-argument errors include a correct example. | `heuristics.try_parse_tool_calls`, `tools.ALIASES` |
+| …emit valid tool calls | **Format-leak salvage**: JSON in text, ```json fences, `<tool_call>` tags, gemma `call:name{…}`, placeholder quotes `<\|"\|>`, bare `finish(summary="x")`. **Loose salvage** also takes the name under `action`/`function`/`tool` with flat arguments (`{"action": "list_dir", "path": "."}`) and Python `None`/`True`/`False`. Tool-name aliases (`write_file`, `bash`, …) and argument aliases (`file_path`, `cmd`, …). Missing-argument errors include a correct example. | `heuristics.try_parse_tool_calls`, `tools.ALIASES` |
 | …self-debug | **Test guard**: when tests exist, the harness runs them itself before accepting `finish` and feeds back the exact failure (`file:line` + the `E` line). pytest → unittest fallback → skip if Python is missing. A broken third-party pytest plugin is detected and retried with autoload off. | `heuristics.run_test_guard` |
-| …stay honest at the end | **Finish gates**, each capped so they can't deadlock: fake finish (no work done) · test guard · claimed files must exist · files named in the plan must exist · plan must be ticked · **delivery self-check** re-injects the original task once. An empty final summary triggers a wrap-up call. | `agent._finish_gates` |
-| …edit code safely | **Rollback everywhere**: backup before every write (`.finch/backups/`), including in-place shell edits (`sed -i`, `>` redirects) detected in commands; `delete_file` goes to `.finch/trash/`; **clobber guard** refuses to overwrite a big file with a much smaller one unless `replace=true`; `/undo`. | `tools.Rollback`, `tools.bash_snapshot` |
+| …stay honest at the end | **Finish gates**, each capped so they can't deadlock: fake finish (no work done) · test guard · claimed files must exist somewhere below the workdir (subdirs, `build/`, `dist/` and dot dirs included) · files named in the plan must exist · plan must be ticked · **delivery self-check** re-injects the original task once. An empty final summary triggers a wrap-up call. | `agent._finish_gates` |
+| …edit code safely | **Rollback everywhere**: backup before every write (`.finch/backups/`), including in-place shell edits (`sed -i`, `>` redirects) detected in commands, ignoring redirects that write no file (`2>/dev/null`, `2>&1`, `>&2`); `delete_file` goes to `.finch/trash/`; **clobber guard** refuses to overwrite a big file with a much smaller one unless `replace=true`; `/undo`. | `tools.Rollback`, `tools.bash_snapshot` |
 | …write escaped code | **Auto-repair**: a `.py` file that fails to compile because of literal `\n` sequences is unescaped (kept only if it then compiles). Edits retry with unescaped `old` text. | `tools.auto_repair` |
 | …crawl huge files | **Crawl guard v2**: byte budget (2× file size, clamped 64KB–512KB). It never refuses: past the budget it throttles to 2000 chars/read and teaches the "one script" approach. Nudges at reads 4 and 10. | `tools.ToolBox.t_read_file` |
 | …manage long contexts | **Tiered compaction** by preflight estimate *and* actual `prompt_eval_count`: 60% → truncate old tool outputs, 75% → summarise older turns, 90% → full rebuild. The summary carries the verbatim task, the live plan and the workdir listing. Overflow errors force L3. Tiers re-arm when usage drops. | `agent.compact` |
 | …keep the plan alive | Stale-plan nudge after 4 productive steps without a todo update. | `agent._loop` |
 | …survive a flaky server | 500s → compact + inject a path-breaking message (same messages on a degraded runner reproduce the same failure); exponential backoff; optional restart hook `FINCH_OLLAMA_RESTART_CMD` after 4 consecutive 500s. `keep_alive=30m` is sent top-level so the model isn't unloaded mid-task. Bash runs in its own process group and the whole tree is killed on timeout. | `agent._loop`, `llm.py` |
-| …be trusted with your disk | **Safety rings**: ① irreversible ops refused outright (`rm -rf /`, `mkfs`, `dd of=/dev/sd*`, `curl … \| sh`, `shutdown`…) · ② uninstalls / env mutation need confirmation, and are denied when unattended; recursive deletes only inside the workdir · ③ out-of-workdir paths and sensitive files (`.ssh`, `.env`, keys…) need confirmation; sensitive writes are always refused · ④ rollback (above). `/unsafe` bypasses ring ② only. | `safety.py` |
+| …be trusted with your disk | **Safety rings**: ① irreversible ops refused outright (`rm -rf /`, `mkfs`, `dd of=/dev/sd*`, `curl … \| sh`, `shutdown`…) · ② uninstalls / env mutation need confirmation, and are denied when unattended; recursive deletes only inside the workdir · ③ out-of-workdir paths and sensitive files (`.ssh`, `.env`, keys…) need confirmation; anything below the workdir needs none, including absolute paths to it in shell commands and sensitive-named files you put in the project (unless the workdir is your home dir); sensitive writes are always refused · ④ rollback (above). `/unsafe` bypasses ring ② only. | `safety.py` |
 | …manage wall-clock time | Timebox pacing nudges at 50/75/90%. | `heuristics.budget_nudge` |
 | …read office files | `read_file` extracts text from **.xlsx / .xlsm / .docx / .pptx** with the standard library (spreadsheets come back as numbered rows with dates formatted, one `## Sheet:` block per sheet) and from **.pdf** via `pypdf` or `pdftotext` if either is installed (otherwise it says how to get one). Old .xls/.doc/.ppt get a LibreOffice conversion hint. A script that dies on `import openpyxl/pandas/docx…` is told to use `read_file` instead. | `docs.py`, `tools.ToolBox.t_read_file` |
 | …see | `read_file` on an image attaches it to the next request (vision models); `@image.png` in the prompt too. | `tools._read_image` |
@@ -170,7 +170,7 @@ Every character is sent with every request, so the picker shows each soul's toke
 
 In "yours" mode an empty prompt starts as a copy of the built-in one, so you can change it rather than start from
 nothing. Keep the tool rules (todo, enable_tools, finish) if you do: small models lean on them. `{workdir}`, `{home}`,
-`{os}`, `{shell}` and `{python}` are filled in. The soul, FINCH.md and "Force English" still apply on top.
+`{os}`, `{shell}`, `{python}` and `{date}` are filled in. The soul, FINCH.md and "Force English" still apply on top.
 **Reset system prompt** deletes your text. Both are saved in config.json (`system_prompt`, `system_prompt_mode`) and
 in profiles.
 
@@ -218,7 +218,7 @@ status bar shows the next or running job.
 
 ## Toggleable tricks
 
-Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 37 of them in 7 groups) that
+Every mechanism in the table above is a named **trick** (`finch/tricks.py`, 41 of them in 7 groups) that
 can be switched off. Use the Tricks tab in `/settings`, `/tricks <key> off`, `"tricks": {"crawl_guard": false}`
 in config.json, or `FINCH_ABLATION=key1,key2` (Mingbird's ablation names `finish_gate`, `anti_loop` and
 `flat_prefill` are accepted as aliases). "Disable all tricks" gives you a plain agent loop for comparison.
@@ -270,6 +270,29 @@ not ten file dumps, which matters on a 32K window.
 - Each subagent's transcript is saved to `~/.finch/sessions/subagents/` (named after the parent session), and
   `/resume` doesn't list them.
 - Turn it off like any tool: the Tools tab, or `/tools spawn_agent off`.
+- The built-in `delegate` skill tells the model how to split work and brief subagents (see below). It only
+  shows up where `spawn_agent` can be used, so it's hidden inside subagents and when the tool is off.
+
+## Built-in skills
+
+| Skill | For |
+|---|---|
+| `bug_fix` | reproduce, locate, minimal fix, verify |
+| `test_driven` | tests first, then the code, until green |
+| `python_project` | layout and conventions for a small Python project or CLI |
+| `code_review` | bugs, edge cases and clarity, most severe first |
+| `data_analysis` | CSV/JSON through one script instead of reading rows |
+| `web_research` | several search angles, fetch, a sourced report |
+| `explore_codebase` | map an unfamiliar project (README, search, tests) before changing it |
+| `long_input` | a file, PDF or log too long for the context: search first, else read in chunks and take notes |
+| `long_output` | a long report or file written in sections so it doesn't get cut off |
+| `multi_file_change` | rename a function/class/setting across files, verified by search and tests |
+| `bulk_files` | move, sort or rename many files with a dry-run script first |
+| `delegate` | split big work into independent parts, one subagent each, with a GOAL / CONTEXT / OUTPUT / DONE WHEN / DON'T brief |
+
+They're written for small models: each is a short numbered checklist under 1000 characters that names the real
+tools, and the descriptions are kept distinct because the model chooses by description alone. The inline index
+lists up to 16 skills, so a few of your own still fit without a list round-trip.
 
 ## Custom skills
 
@@ -301,6 +324,15 @@ with the same name as a built-in replaces it. To add one:
 - Or just drop a `.md` file into either folder; it shows up on the next turn.
 
 Keep skills short and numbered: small models follow a short checklist much better than prose.
+
+A skill that only works with certain tools can say so with `requires: spawn_agent` (comma-separated tool names) in
+its frontmatter. It is left out wherever one of those tools can't be used: switched off, a web tool in offline
+mode, or `spawn_agent` inside a subagent. That way the model never loads a skill it can't follow.
+
+Small models rarely look up a skill on their own. `preload: web` (a routing category: `file`, `code`, `web`,
+`memory`, `mcp` or `agent`) adds the skill's steps to the task whenever routing picks that category, and the task
+header shows `skill: <name>`. Use it sparingly: a preloaded skill costs its full text on every matching task. The
+**Skill preload** trick switches it off.
 
 ## Settings profiles
 

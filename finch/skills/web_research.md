@@ -1,6 +1,7 @@
 ---
 name: web_research
 description: Research a topic on the web and write a sourced report
+requires: web_search_multi, web_fetch
 ---
 # Web research
 1. Plan 3-5 distinct queries (different angles, not rephrasings). Use web_search_multi.

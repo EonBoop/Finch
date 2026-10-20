@@ -13,21 +13,21 @@ from .llm import Cancelled, LLMError, model_params_b
 SYSTEM = """You are an autonomous agent working in a workspace directory on the user's machine.
 JUDGE INTENT FIRST:
 - Chit-chat, greetings, questions about yourself, general knowledge: answer directly in text. No tools, no todo, no files.
-- Real work (write/change files, run code, analyse data, research, fix bugs): first call todo(action=create) with a numbered plan, then execute it step by step with tools, ticking items off as you go.
+- Real work (write/change files, run code, analyse data, research, fix bugs): {skill_step}call todo(action=create) with a numbered plan, then execute it step by step with tools, ticking items off as you go.
 RULES:
 - Actually DO the work with tools (write code, run it, fix errors until verified). Never just describe it.
 - Need web/memory/MCP/python/append/delete/search? Call enable_tools first; they then become available.
 - Work only inside the working directory with relative paths. Never cd elsewhere or invent paths like /workspace.
 - Home directory: {home}. To save outside the workspace (e.g. {home}/Desktop) use the real absolute path; the user will confirm.
 - Be concise in text; put large content in tool arguments. Call finish only when answered or fully verified done.
-System: {os}; shell: {shell}; python: {python}.
+System: {os}; shell: {shell}; python: {python}. Today: {date}.
 Working directory (all commands and relative paths run here): {workdir}"""
 
 CHAT_SYSTEM = """You are a local AI assistant talking with the user.
 - Answer directly, naturally and concisely, like a person would.
 - Only use tools when you need to look something up (read a file, list a directory, search the web); otherwise just answer in text.
 - When you have answered, stop. Don't repeat yourself or list what you could do.
-Working directory: {workdir}"""
+Today: {date}. Working directory: {workdir}"""
 
 SUB_RIDER = """You are a SUBAGENT: another agent handed you the one task in the user message. Do only that task.
 Nobody can answer questions: decide for yourself. When done, call finish with a summary of what you did and found
@@ -167,7 +167,16 @@ class Agent:
     # ---------------- prompt assembly ----------------
     def prompt_vars(self):
         return {"home": os.path.expanduser("~"), "workdir": self.tb.workdir, "python": os.path.basename(self.s.python),
-                "os": f"{platform.system()} {platform.release().split('-')[0]}", "shell": osutil.shell_name()}
+                "os": f"{platform.system()} {platform.release().split('-')[0]}", "shell": osutil.shell_name(),
+                "date": time.strftime("%Y-%m-%d (%A)"), "skill_step": self._skill_step()}
+
+    def _skill_step(self):
+        """skill_first: tell the model to check the skills before planning (only when it has some to load)."""
+        if not (self.s.on("skill_first") and self.s.tool_on("skills")):
+            return "first "
+        if {i["name"] for i in T.skill_infos(self.tb.workdir)} <= self.tb.hidden_skills():
+            return "first "
+        return "load the skill that fits it if the skills tool lists one, then "
 
     def custom_prompt(self):
         """The user's system prompt text with {workdir}-style placeholders filled ("" when unused).
@@ -184,7 +193,7 @@ class Agent:
         custom = self.custom_prompt()
         mode = self.s.system_prompt_mode
         if qa:
-            base = CHAT_SYSTEM.format(workdir=wd)
+            base = CHAT_SYSTEM.format(workdir=wd, date=self.prompt_vars()["date"])
         elif custom and mode == "replace":
             base = custom
         else:
@@ -213,7 +222,7 @@ class Agent:
         if name == "enable_tools":
             return T.enable_tools_def(self.s)
         if name == "skills" and self.s.on("skill_index"):
-            return T.skills_def(self.tb.workdir, self.s.skills_off)
+            return T.skills_def(self.tb.workdir, self.tb.hidden_skills())
         return T.ALL_BUILTIN[name]
 
     def tool_surface(self, qa, cats, extra, disabled):
@@ -232,7 +241,7 @@ class Agent:
         names = {n for n in names - disabled if self.s.tool_on(n)}
         if self.depth:
             names.discard("spawn_agent")
-        if "skills" in names and not any(self.s.skill_on(i["name"]) for i in T.skill_infos(self.tb.workdir)):
+        if "skills" in names and {i["name"] for i in T.skill_infos(self.tb.workdir)} <= self.tb.hidden_skills():
             names.discard("skills")
         if offline:
             names -= T.ONLINE_TOOLS
@@ -323,6 +332,10 @@ class Agent:
             msgs.insert(0, sysmsg)
         cats = set() if qa else H.route_categories(user_text)
         info = {"categories": sorted(cats)}
+        pre = self.tb.preloaded_skills(cats) if self.s.on("skill_preload") else []
+        if pre:
+            um["content"] = user_text + "\n\n[harness] A skill fits this task. Follow its steps:\n" + "\n".join(pre)
+            info["skills"] = [p.split("\n", 1)[0].removeprefix("### SKILL: ") for p in pre]
         budget_min = self.timebox_min
         if not qa and self.s.on("timebox_parse"):
             parsed = H.parse_time_budget(user_text)
@@ -575,7 +588,7 @@ class Agent:
             salvaged = False
             if not tcs and not qa and content and on("salvage"):
                 known = set(T.ALL_BUILTIN) | set(T.ALIASES)
-                calls = H.try_parse_tool_calls(content, known)
+                calls = H.try_parse_tool_calls(content, known, loose=on("loose_salvage"))
                 if calls:
                     tcs = [{"function": {"name": n, "arguments": a}} for n, a in calls]
                     salvaged = True

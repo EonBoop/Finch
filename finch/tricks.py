@@ -15,6 +15,10 @@ TRICKS = [
      "A real tool that isn't loaded gets loaded on the fly instead of refused."),
     ("skill_index", "Prompt & routing", "Inline skill index",
      "The skills tool lists each skill's name and one line, so one call loads a skill. Off = list first, then load."),
+    ("skill_first", "Prompt & routing", "Skill-first rule",
+     "The task prompt says to load a fitting skill before planning. Off = skills are only listed in the tool."),
+    ("skill_preload", "Prompt & routing", "Skill preload",
+     "A skill with `preload: <category>` is put into the task when routing picks that category (delegate for subagents)."),
     ("small_model", "Prompt & routing", "Small-model protocol",
      "For ≤4B models: edit_file off up front, bash output trimmed, shell-vs-python hint."),
     ("timebox_parse", "Prompt & routing", "Timebox from task text",
@@ -22,6 +26,8 @@ TRICKS = [
     # ---- output repair
     ("salvage", "Output repair", "Tool-call salvage",
      "Turn tool calls written as text (JSON, fences, call:name{…}, finish(...)) into real calls."),
+    ("loose_salvage", "Output repair", "Loose call salvage",
+     "Salvage also takes {\"action\": \"list_dir\", \"path\": \".\"}-style calls and Python None/True/False."),
     ("aliases", "Output repair", "Name aliases",
      "Map write_file→create_file, bash→run_bash, file_path→path, … instead of failing."),
     ("auto_repair", "Output repair", "Escape auto-repair",
@@ -80,6 +86,8 @@ TRICKS = [
     # ---- safety (the hard ring is always on)
     ("backups", "Safety", "Backups & trash",
      "Back up before every write (incl. sed -i / redirects); delete_file goes to trash; /undo."),
+    ("quiet_redirects", "Safety", "Ignore null redirects",
+     "2>/dev/null, 2>&1 and >&2 don't count as file writes, so `find … 2>/dev/null` isn't reported as a rewrite."),
     ("clobber_guard", "Safety", "Clobber guard",
      "Refuse to overwrite a big file with a much smaller one unless replace=true."),
     ("behaviour_tiering", "Safety", "Behaviour tiering (ring 2)",
@@ -104,6 +112,18 @@ DETAILS = {
         "Because of flat prefill, the model sometimes calls a real tool that wasn't sent this turn. Finch loads "
         "that tool and runs the call instead of returning an error. Off: the call is refused, and the model has "
         "to load the tool with enable_tools first, which small models often fail to do.",
+    "skill_preload":
+        "Small models rarely look up a skill on their own, even when one fits: asked to use subagents, gemma4:12b "
+        "never loaded the delegate skill and delegated backwards (it read every file itself, then had a subagent "
+        "write the result). A skill can say `preload: agent` (a routing category: file, code, web, memory, mcp, "
+        "agent). When the task routes to that category, the skill's steps are added to the task message, so the "
+        "model plans with them from its first step. Off: skills are only loaded when the model asks for one.",
+    "skill_first":
+        "The skills tool lists every skill, but on its own that wasn't enough: in a six-task test on 2026-10-19 "
+        "qwen3.6 never called it once, even when a skill fitted exactly (a custom changelog skill, a long log file). "
+        "Nothing in the prompt said to look. With this on, the task prompt's real-work rule starts with \"load the "
+        "skill that fits it if the skills tool lists one, then\" make the plan. It is left out when the skills "
+        "tool is off or every skill is hidden. Off: the model has to notice the skills tool by itself.",
     "skill_index":
         "Every extra turn costs a small model 20-90 seconds and is another chance to wander off. Finch writes the "
         "name and one-line description of each enabled skill into the skills tool itself, so the model can load "
@@ -123,6 +143,12 @@ DETAILS = {
         "call:name{…} or a bare finish(summary=\"…\")) instead of making a real call. Finch recognises these and "
         "runs them as real calls. Off: such text is treated as a normal reply, so the action never happens and "
         "the run usually stalls.",
+    "loose_salvage":
+        "Some models write the call as JSON but put the tool name under \"action\", \"function\" or \"tool\" "
+        "with the arguments flat beside it ({\"action\": \"list_dir\", \"path\": \".\"}), or use Python's None, "
+        "True and False. lfm2.5-8b and hermes3:3b both do this; plain salvage misses it, so the call never runs "
+        "and the model repeats it until the turn ends. Finch accepts these forms too (unknown tool names are still "
+        "rejected). Off: only the standard shapes are salvaged.",
     "aliases":
         "Models trained on other agent harnesses use their tool and argument names (write_file, bash, file_path). "
         "Finch maps these onto its own (create_file, run_bash, path). Off: a wrong name fails with an "
@@ -196,7 +222,8 @@ DETAILS = {
         "the model the exact file:line and error and asks for a fix. Allowed through after 3 failed attempts, so "
         "it can't loop forever. Off: the model's own claim that the tests pass is trusted.",
     "artifact_gate":
-        "Checks that every file the finish summary claims to have made actually exists, and that every output "
+        "Checks that every file the finish summary claims to have made actually exists somewhere below the "
+        "workdir, and that every output "
         "file named in the plan exists too. Missing files mean the finish is rejected (at most twice per check). "
         "Off: the summary can mention files that were never written.",
     "plan_sync_gate":
@@ -233,6 +260,11 @@ DETAILS = {
         "Before any file is written (including shell edits like sed -i and > redirects), Finch saves a copy in "
         ".finch/backups/. delete_file moves files to the trash instead of deleting them. /undo restores the "
         "latest change. Off: writes and deletes are final.",
+    "quiet_redirects":
+        "The backup check treats any > in a shell command as a possible file write, so `find . -name app.py "
+        "2>/dev/null` backed up app.py and told the model it had been rewritten in place, which it then had to "
+        "make sense of. Redirects to /dev/null or NUL and file-descriptor copies (2>&1, >&2) write no file, so "
+        "Finch ignores them. Off: every > counts, which is harmless (an extra backup) but adds a misleading note.",
     "clobber_guard":
         "Stops an existing file over 300 bytes being replaced by something less than half its size, which "
         "usually means the model rewrote it from a partial memory. The model has to pass replace=true to do it "

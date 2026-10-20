@@ -110,7 +110,8 @@ ALIASES = {
     "append_to_file": "append_file", "edit": "edit_file", "replace_in_file": "edit_file",
     "str_replace": "edit_file", "search_code": "search_files", "grep": "search_files",
     "delete": "delete_file", "remove_file": "delete_file", "bash": "run_bash", "shell": "run_bash",
-    "execute_command": "run_bash", "run_command": "run_bash", "exec": "run_bash",
+    "execute_command": "run_bash", "run_command": "run_bash", "exec": "run_bash", "execute_shell": "run_bash",
+    "run_shell": "run_bash", "run_terminal_cmd": "run_bash",
     "python": "run_python", "execute_python": "run_python", "done": "finish", "complete": "finish",
     "task_complete": "finish", "attempt_completion": "finish",
     "subagent": "spawn_agent", "spawn_subagent": "spawn_agent", "delegate": "spawn_agent",
@@ -312,9 +313,15 @@ class Rollback:
         return f"nothing to restore for {self.rel(p)}"
 
 
-def bash_snapshot(cmd, workdir, rollback):
+# 2>/dev/null, &>NUL, 2>&1, >&2: redirects that write no file
+_NULL_REDIRECT_RE = re.compile(r"(?:\d|&)?>>?\s*(?:&\d+|/dev/null|nul)(?![\w./\\-])", re.I)
+
+
+def bash_snapshot(cmd, workdir, rollback, quiet_redirects=False):
     """sed -i / > redirects / cp / mv rewrite files in place, bypassing the write tools'
     backups. Snapshot every existing workdir file the command names."""
+    if quiet_redirects:
+        cmd = _NULL_REDIRECT_RE.sub(" ", cmd)
     low = f" {cmd} "
     if not any(s in low for s in ("sed -i", "sed --in-place", ">", " tee ", "cp ", "mv ",
                                   "truncate ", "perl -pi", "dd ")):
@@ -340,10 +347,12 @@ def bash_snapshot(cmd, workdir, rollback):
     return out
 
 
-def walk_files(root, limit=20000):
+def walk_files(root, limit=20000, skip=None):
+    """Files below root. Default skips SKIP_DIRS and dot dirs; pass `skip` to skip only those."""
     n = 0
     for dp, dns, fns in os.walk(root):
-        dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")]
+        dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")] if skip is None \
+            else [d for d in dns if d not in skip]
         for fn in fns:
             yield os.path.join(dp, fn)
             n += 1
@@ -400,11 +409,22 @@ def _skill_bases(workdir):
             (PKG_SKILLS, "built-in")]
 
 
-def _skill_desc(path):
+def _skill_head(path):
     try:
-        head = read_text(path)[:600]
+        return read_text(path)[:600]
     except Exception:
         return ""
+
+
+def _skill_list(head, key):
+    """A comma-separated frontmatter line: `requires:` tools (hidden where one can't be used) or
+    `preload:` routing categories (put into the task when routing picks one)."""
+    m = re.search(rf"^{key}:\s*(.+)", head, re.M)
+    return [t.strip() for t in m.group(1).split(",") if t.strip()] if m else []
+
+
+def _skill_desc(path, head=None):
+    head = _skill_head(path) if head is None else head
     m = re.search(r"description:\s*(.+)", head)
     if m:
         return m.group(1).strip().strip("\"'")[:120]
@@ -424,7 +444,9 @@ def skill_infos(workdir):
                 n = f.rsplit(".", 1)[0]
                 if f.endswith((".md", ".txt")) and n not in seen:
                     p = os.path.join(base, f)
-                    seen[n] = {"name": n, "desc": _skill_desc(p), "scope": scope, "path": p}
+                    head = _skill_head(p)
+                    seen[n] = {"name": n, "desc": _skill_desc(p, head), "scope": scope, "path": p,
+                               "requires": _skill_list(head, "requires"), "preload": _skill_list(head, "preload")}
     return [seen[n] for n in sorted(seen)]
 
 
@@ -434,7 +456,7 @@ def list_skills(workdir, off=()):
     return "\n".join(lines) or "(none)"
 
 
-SKILL_INDEX_MAX = 12
+SKILL_INDEX_MAX = 16
 
 
 def skills_def(workdir, off=()):
@@ -942,7 +964,8 @@ class ToolBox:
         if "\n" not in cmd and re.search(r"\\\\+n", cmd):
             cmd = re.sub(r"\\\\+n", "\n", cmd)
         cmd = re.sub(r'\\\\+"', '"', cmd)
-        snapped = bash_snapshot(cmd, self.workdir, self.rollback) if self.s.on("backups") else []
+        snapped = (bash_snapshot(cmd, self.workdir, self.rollback, self.s.on("quiet_redirects"))
+                   if self.s.on("backups") else [])
         self._scripted(cmd)
         rc, out, err, timed_out = _run_proc(cmd, self.workdir, self.s.bash_timeout)
         if timed_out:
@@ -1012,10 +1035,31 @@ class ToolBox:
             return format_todo(self.todo)
         return format_todo(self.todo)
 
+    def tool_usable(self, name):
+        if name == "spawn_agent" and self.spawner is None:
+            return False
+        return self.s.tool_on(name) and not (self.s.offline and name in ONLINE_TOOLS)
+
+    def hidden_skills(self):
+        """Skills switched off, plus those that need a tool that can't be used here."""
+        return set(self.s.skills_off) | {i["name"] for i in skill_infos(self.workdir)
+                                         if not all(self.tool_usable(t) for t in i["requires"])}
+
+    def preloaded_skills(self, cats):
+        """'### SKILL: …' texts of the usable skills whose preload category is in cats."""
+        off = self.hidden_skills()
+        return [load_skill(i["name"], self.workdir) for i in skill_infos(self.workdir)
+                if i["name"] not in off and set(i["preload"]) & set(cats)]
+
     def t_skills(self, a):
+        off = self.hidden_skills()
         if not a.get("name") or a.get("action") == "list":
-            return list_skills(self.workdir, self.s.skills_off)
-        return load_skill(a["name"], self.workdir, self.s.skills_off)
+            return list_skills(self.workdir, off)
+        info = next((i for i in skill_infos(self.workdir) if i["name"] == str(a["name"])), None)
+        if info and info["name"] in off and self.s.skill_on(info["name"]):
+            return (f"[skill '{info['name']}' needs {', '.join(info['requires'])}, which can't be used here. "
+                    f"Do the work yourself with the tools you have.]")
+        return load_skill(a["name"], self.workdir, off)
 
     def t_finish(self, a):
         return "[TASK_COMPLETE] " + str(a.get("summary", ""))
@@ -1092,21 +1136,33 @@ _TECH_NAMES = {"node.js", "next.js", "vue.js", "react.js", "three.js", "d3.js", 
                "chart.js", "p5.js", "deno.js", "angular.js", "ember.js", "socket.io", "asp.net"}
 
 
+# the claim check looks in build/, dist/ and dot dirs too: an agent's output can land there
+CLAIM_SKIP_DIRS = {".git", ".finch", "node_modules", "__pycache__", ".venv", "venv"}
+
+
 def missing_files_in_text(text, workdir):
-    """File names mentioned in text that do not exist anywhere in the workdir."""
-    toks = {m.group(0).strip("./") for m in FILE_TOKEN.finditer(text or "")
-            if m.group(0).lower().endswith(ARTIFACT_EXTS)}
-    toks = {t for t in toks if t and not re.match(r"^\d+(\.\d+)+$", t) and "://" not in t
-            and os.path.basename(t).lower() not in _TECH_NAMES}
+    """File names mentioned in text that do not exist anywhere below the workdir."""
+    raw = {m.group(0) for m in FILE_TOKEN.finditer(text or "") if m.group(0).lower().endswith(ARTIFACT_EXTS)}
+    toks = {}
+    for r in raw:
+        t = r.strip("./")
+        if t and not re.match(r"^\d+(\.\d+)+$", t) and "://" not in t \
+                and os.path.basename(t).lower() not in _TECH_NAMES:
+            toks[t] = r
     if not toks:
         return []
     names = None
     missing = []
     for tok in sorted(toks):
+        raw_tok = toks[tok]
         if os.path.isfile(os.path.join(workdir, tok)):
             continue
+        if os.path.isabs(raw_tok):
+            real, inside = safe_path(workdir, raw_tok)
+            if inside and os.path.isfile(real):
+                continue
         if names is None:
-            names = [os.path.basename(f).lower() for f in walk_files(workdir)]
+            names = [os.path.basename(f).lower() for f in walk_files(workdir, skip=CLAIM_SKIP_DIRS)]
         base = os.path.basename(tok).lower()
         if base in names or any(base.endswith(n) for n in names if len(n) > 3):
             continue

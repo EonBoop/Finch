@@ -38,12 +38,12 @@ Useful flags: `-C dir`, `--ctx 65536`, `--think on|off|auto`, `--timebox 40m`, `
 | `finch/mcp.py` | Dependency-free stdio MCP client. Tools are exposed flat as `server.tool`, with a manifest cache. |
 | `finch/ui.py` | `TerminalUI` (live spinner, `●`/`⎿` tool lines, diffs, todo checklist, permission panel) and the headless `PlainUI`. |
 | `finch/cli.py` | REPL, slash commands, `@file` mentions, `!shell`, headless mode. |
-| `finch/tricks.py` | Registry of the 35 toggleable tricks (key, group, label, description) and ablation aliases. |
+| `finch/tricks.py` | Registry of the 41 toggleable tricks (key, group, label, description) and ablation aliases. |
 | `finch/themes.py` | 7 colour themes: rich styles + prompt_toolkit styles, swatch helpers. |
 | `finch/settings_menu.py` | `/settings`: inline prompt_toolkit app with General · Tricks · Theme · Soul · Schedule tabs, plus the job wizard and `choose()` picker. |
 | `finch/scheduler.py` | Task scheduler: schedule phrase parser + 5-field cron engine, file-locked job store (`~/.finch/schedule/jobs.json`), runner `tick()`, per-run supervisor (`finch schedule exec`), daemon, `finch schedule …` CLI. |
 | `finch/souls.py`, `finch/builtin_souls/` | SOUL.md personas: discovery (project > user > built-in), frontmatter parsing, create/edit, injection text. |
-| `finch/skills/*.md` | Built-in skills: bug_fix, test_driven, python_project, web_research, data_analysis, code_review. |
+| `finch/skills/*.md` | Built-in skills: bug_fix, test_driven, python_project, web_research, data_analysis, code_review, explore_codebase, long_input, long_output, multi_file_change, bulk_files, delegate. |
 | `scripts/pty_drive.py` | Dev tool: drives the REPL in a pty (pexpect + pyte, answers CPR) and prints the screen. Use it to verify menus/toolbars. |
 | `CLAUDE.md` | Local only (gitignored). Short orientation for Claude: commands, layout, invariants, gotchas, how this user works. |
 | `finch/osutil.py` | Every OS difference: shell choice and argv, process groups / tree kill, pid liveness, file lock, retried `os.replace`, console decoding, python discovery, UTF-8 child env. |
@@ -65,10 +65,10 @@ Runtime state lives in `~/.finch/`: `config.json`, `sessions/`, `memory.json`, `
 | Empty-turn ladder | Nudge at 3; hard reset (task + plan + file listing) at 6, at most 3 times; then a graceful stop. An unclosed `<think>` counts as empty. |
 | Truncation feedback | `done_reason=length` with nothing useful → "skeleton with create_file, then append_file". |
 | Stall feedback (Finch) | No data for `stream_timeout` (a huge tool call: Ollama streams nothing while one is written) → "write it in pieces", line budget shrinking per repeat, no back-off. |
-| Format-leak salvage | JSON, ```json fences, `<tool_call>`, gemma `call:name{…}`, `<\|"\|>` placeholder quotes, bare `finish(summary="x")`. |
+| Format-leak salvage | JSON, ```json fences, `<tool_call>`, gemma `call:name{…}`, `<\|"\|>` placeholder quotes, bare `finish(summary="x")`. Loose salvage: name under `action`/`function`/`tool`, flat args, Python literals. |
 | Finish gates | Fake finish → test guard → claimed files exist → plan-named files exist → plan ticked → one-time re-injection of the original task. Every gate is capped so none can deadlock. |
 | Test guard | The harness runs pytest itself and feeds back the exact `file:line` and `E` line. Falls back to unittest, then skips if Python is missing. |
-| Rollback ring | Backup before every write, including shell in-place edits. Trash instead of delete. Clobber guard (an existing file over 300 B can't be overwritten with less than 50% of its size without `replace=true`). `/undo`. |
+| Rollback ring | Backup before every write, including shell in-place edits (null and fd-copy redirects ignored). Trash instead of delete. Clobber guard (an existing file over 300 B can't be overwritten with less than 50% of its size without `replace=true`). `/undo`. |
 | Auto-repair | A `.py` file that fails to compile because of literal `\n` gets unescaped, and the change is kept only if it then compiles. |
 | Crawl guard v2 | Byte budget of 2× file size (clamped 64KB–512KB). It never refuses; past the budget it throttles to 2000 chars per read and suggests a script. |
 | Tiered compaction | Triggered by both the preflight estimate and `prompt_eval_count`. 60% → truncate old tool outputs; 75% → summarise; 90% → full rebuild. Tiers re-arm when usage drops; overflow errors force a full rebuild. |
@@ -530,3 +530,180 @@ speed: a child that reads ten files to answer one question costs the parent a fe
   whose summary reports verified work.
 - Not verified: Windows (no OS-specific code was added), and ctrl+c during a live child (covered by
   `test_subagent_interrupt_reaches_the_parent` with a scripted model).
+
+## Follow-up: more built-in skills
+
+Goal: built-in skills for the jobs where a small model fails in ways the tricks don't already catch.
+
+Design rules (research + this repo's own results):
+- **Few, distinct skills.** Practitioner reports (PostHog's "writing agent skills"; RAG-MCP and BFCL numbers on
+  tool counts) agree that picking the right entry gets worse as the catalog grows and as entries look alike, and
+  small models suffer most. Every index row is prefill on every turn. So 5 new (11 built-in, under `SKILL_INDEX_MAX`
+  12), and descriptions that don't share a lead verb: `bulk_files` and `multi_file_change` both opened with
+  "Rename" in the first draft.
+- **Short, most important rule first.** IFScale (arXiv 2507.11538): instruction following decays as instructions
+  pile up, and models favour earlier ones. Each body is ≤ 6 steps and under 1000 chars.
+- **Name the real tools and give runnable steps.** No advice the model has to turn into actions itself.
+- New test `test_builtin_skills_stay_small` holds the count (< 12), description (≤ 80, the index cut) and size
+  (≤ 1000 chars) rules. The Skills-tab test no longer hardcodes the built-in count.
+
+New skills: `explore_codebase` (small context: search, then read only what matters; baseline tests; a 5-line map),
+`long_input` (search first, else 150-line chunks with notes appended to a file, so they survive compaction),
+`long_output` (outline in todo, create then append one section per call, read back), `multi_file_change`
+(search every use, baseline tests, one file at a time; run_python not `sed -i`, which differs per OS),
+`bulk_files` (dry run, then apply).
+
+Verified live, gemma4:12b, headless, "… Use a skill if one fits", one run each:
+- bulk_files, first draft (write organize.py with a `--apply` flag): loaded, but the model skipped the dry run and
+  moved everything in one run_python. Rewritten as "TWO run_python calls: the first only PRINTS the plan" in the
+  first line: it printed "Plan: 25 files to move", then moved, then checked each folder (168 s, all 25 correct).
+- multi_file_change: `Skill(list)` then load; renamed across 4 files, 3/3 tests pass (226 s). It used `sed -i`,
+  hence the OS note in step 4.
+- explore_codebase: loaded, wrote the map, added `average_total` + test, 4/4 pass (332 s). It skipped running the
+  tests first (step 4).
+- Not picked up: long_input (a 890-line report; correct 8/8 summary, but it crawled the file in overlapping ranges,
+  then scripted it, 608 s), long_output (a 68-line guide fit in one create_file anyway), and a 1200-line log (the
+  model scripted it, which is right; logs now point to data_analysis). **Observed limit:** these two skills trigger
+  on a property ("too long") the model only discovers after reading, or never anticipates. The descriptions can't
+  fix that. A possible trick: name the skill in the read_file truncation note and the truncation feedback.
+- Also seen: `execute_shell` is not in `ALIASES` (it got "unknown tool" and recovered by enabling run_python).
+
+## Follow-up: delegate skill, skill requires/preload, execute_shell
+
+Research on multi-agent workflows, and what carries over to `spawn_agent` (serial, one level, fresh context,
+3000-char summary, shared workdir, 6 per turn):
+- Anthropic, "How we built our multi-agent research system": orchestrator-worker. Each subagent brief needs an
+  objective, an output format, the tools/sources to use and clear boundaries. Short briefs gave duplicated and
+  misread work. Effort scales with the task (simple: one agent; comparison: 2-4 subagents). Early versions spawned
+  50 subagents for simple queries. Large results go to storage and the lead gets references back. It's a poor fit
+  for tightly coupled work such as most coding.
+- Cognition, "Don't build multi-agents": actions carry implicit decisions, and parallel subagents make conflicting
+  ones (the Flappy Bird example). Acceptable: subagents that answer one well-defined question. → fix the shared
+  choices in every brief, and keep linked edits in the parent.
+- MAST (Cemri et al., arXiv 2503.13657): most multi-agent failures are specification, inter-agent misalignment
+  and missing verification, not model limits. → the parent checks every output.
+- Żywot et al., "Can Small Agents Collaborate…" (ICLR 2026, Qwen3 1.7-32B): an 8B orchestrator + small workers
+  matched a 32B single agent on GAIA. The system is "planner-limited rather than executor-limited": worker size
+  barely mattered, and orchestrator thinking was what paid. → the guidance has to reach the planner.
+
+Changes:
+- Skill `delegate` (`requires: spawn_agent`, `preload: agent`): reading belongs to the subagent, 2-4 parts (max
+  6), shared choices first, a GOAL / CONTEXT / OUTPUT / DONE WHEN / DON'T brief, read and check each output,
+  combine and verify. 886 chars.
+- Skill frontmatter `requires:` (tools). `ToolBox.hidden_skills()` = skills_off + skills that need an unusable
+  tool (`tool_usable`: off, offline web tool, or spawn_agent without a `spawner`, i.e. in a subagent). The index,
+  `list`, `load` and the "drop the skills tool" check all use it. Loading one gets "needs X, which can't be used
+  here". `web_research` now requires web_search_multi + web_fetch, so offline mode hides it.
+- Trick `skill_preload` (Prompt & routing, 38 tricks): `preload: <category>` skills that are usable get appended
+  to the task message ("[harness] A skill fits this task. Follow its steps:") when `route_categories` picks the
+  category. The task header shows `skill: delegate`. It modifies the stored user message (like an @-mention
+  inline), so it survives compaction. `snapshot_reset` uses `_turn_task`, which stays the bare text.
+- `SKILL_INDEX_MAX` 12 → 16: 12 built-ins would have filled the index. It caps big catalogs; it costs nothing below.
+- `ALIASES`: `execute_shell`, `run_shell`, `run_terminal_cmd` → run_bash. Resolved before the surface check
+  (`agent.py` alias step), so an unloaded run_bash is auto-loaded instead of "unknown tool".
+- Tests: 210 (2 new: requires hiding, preload into the parent but not the child or a non-agent task or with the
+  trick off). Aliases test covers execute_shell.
+
+Verified live, gemma4:12b, three 300-line regional reports, "overview.md with revenue, top product and one notable
+event for each":
+- A, "Use a skill if one fits" (no preload, since no agent category): never called skills, crawled all three files in
+  one context with dup/streak/partial-read warnings, hit the 25-min timeout (overview.md was written).
+- B, "Use subagents: …" with the first skill draft and no preload: never loaded `delegate`. It read all three
+  files itself, then spawned one subagent just to write overview.md: delegation backwards (709 s).
+- C, same task as B, with preload and the reworked skill: header `skill: delegate`; the parent didn't read the inputs,
+  spawned 3 subagents (one per report, 240-306 s each), each wrote `reports/<region>_data.md` in the same format
+  given in the brief, then the parent read the three files and wrote overview.md (996 s).
+- Revenue and top product were right in A, B and C. "Notable event" turned out to be ambiguous in the test data
+  (filler like "Supplier delays were reported" is arguably an event): C got 1/3 of the planted events, A and B 0/3.
+  Don't read much into that number.
+- C's briefs had GOAL, CONTEXT and an exact OUTPUT format but no DONE WHEN / DON'T. Delegation was slower than the
+  single-agent B on files this small. The gain is context isolation, which should pay as inputs grow; not measured.
+- pty: Tricks tab "Skill preload ● on", 38/38.
+
+## Follow-up: test-model check, loose salvage, null redirects
+
+2026-10-19. Question: can hermes3:3b do anything useful with tools? Five easy headless tasks (port Q&A, create and
+run fizzbuzz.py, fix a failing test, find a definition, total a CSV), `-y`, scratch `FINCH_HOME`.
+- **hermes3:3b: 0/5, zero tool calls executed.** Straight against Ollama (1–2 tools, no Finch prompt) it never emits
+  native `tool_calls` (0/6); it writes the call as JSON text. With 2 tools that JSON is clean and salvage takes it.
+  With Finch's prompt it degrades into invented call chains, prose plans and "I have run create_file…" claims;
+  every run ended on repeated-text detection.
+- **pierreprudh/lfm2.5-8b-a1b:Q8_0: 3/5** (port Q&A, find definition, CSV total), 74–202 s each. Native tool
+  calls 6/6 against Ollama; reasoning arrives as inline `<think>`. It is 8B (1B active), so the ≤4B small-model
+  protocol does not apply to it.
+- **qwen3.6:35b-a3b-q4_K_M: 5/5**, 33–62 s each, no salvage or loop guards needed. One oddity: in t4 it
+  called web_search with `grep "def compute_tax"`, then read the files and answered correctly.
+  Decision: qwen3.6 is the only test model from now on; no separate small-model test model.
+- lfm2.5 failure modes: mangles long paths (drops the `11f6…` segment of the scratch dir, then `find`s its way
+  back); fizzbuzz.py written with literal `\n` *and* a leading `#!`, so the whole file is one comment, compiles,
+  and auto-repair never fires (run_python had the same literal `\n`; the empty output was reported as "verified").
+  Not fixed yet.
+
+Two new tricks (40 now):
+- `loose_salvage` (Output repair): `try_parse_tool_calls(..., loose=True)` also takes the name under
+  `action`/`function`/`tool`/`name` as a string, with arguments nested (`arguments`/`parameters`/`args`) or flat
+  beside it, and retries JSON with Python `None`/`True`/`False` outside strings. Unknown names still rejected.
+  Every captured hermes3/lfm2.5 output of these shapes now parses (e.g. `{"action": "list_dir", "path": "."}`).
+- `quiet_redirects` (Safety): `bash_snapshot` strips `2>/dev/null`, `&>NUL`, `2>&1`, `>&2` before looking for
+  writes. Before, `find /tmp -name app.py 2>/dev/null` backed up app.py and told the model "[auto-backup before
+  in-place rewrite: app.py]". `echo y > app.py 2>/dev/null` is still snapshotted.
+- Tests: 217 (7 new: four loose shapes, unknown-name rejection, agent-level on/off, null-redirect snapshot on/off).
+
+Verified live with lfm2.5:
+- t1 again: the model ran the same `find … 2>/dev/null`; no backup note; correct answer (8080, `--port=`).
+- t3 three more times: 1/3 fixed the bug (native calls, test guard ran). **Loose salvage did not fire in any of
+  them**: the text calls varied to `{"action": "list_dir", …  // comment` (invalid JSON) and `{"todo": [ {...} ]}`
+  blobs that aren't call shapes. Fix 2 is verified on the captured real outputs and unit tests, not in a live win.
+- pty: Tricks tab 40/40 with "Loose call salvage ● on"; `/tricks quiet_redirects` shows the detail.
+
+## Follow-up: do agents load skills? (skill_first, date in the prompt)
+
+2026-10-19, qwen3.6:35b-a3b-q4_K_M, six headless tasks that each fit one skill, prompts that never mention skills
+(sort 30 files → bulk_files; 600-row CSV question → data_analysis; 1,500-line log → long_input; changelog entry →
+a custom user skill `release_notes` with a marker line `Reviewed-by: finch-release-bot`; "use subagents" → delegate;
+rename across 4 files → multi_file_change).
+- **The model never called the skills tool**, in any of the five task-mode runs, although it was in the surface every
+  time with all 13 skills (custom one included) in its description. Only `delegate` was used, via preload, and
+  that run followed it well (3 children, the parent never read the inputs).
+- Outcomes: 3/6 right without skills (sort, delegate, rename). Wrong: the log summary missed the `WARN` line
+  (grep for `WARNING` doesn't match `WARN`) and said "0 warnings"; the changelog had no marker line and the date
+  2026-09-05 (neither prompt had the date); the CSV question was routed to chat mode (read-only tools, no
+  run_python), so the model summed 600 numbers by hand, hit the output cap and gave no answer after 1,126 s.
+  The chat-routing bug is not fixed yet.
+
+Changes:
+- Today's date (`2026-10-19 (Monday)`) in both system prompts, and `{date}` for custom prompts.
+- Trick `skill_first` (Prompt & routing, 41 tricks): the real-work line says "load the skill that fits it if the
+  skills tool lists one, then call todo(action=create)…". Left out when the skills tool is off or every skill is
+  hidden (`_skill_step`). Test: 218.
+
+Re-run of the changelog and log tasks, fresh fixtures:
+- Date fixed: `## [1.2.0] - 2026-10-19`.
+- **skill_first had no effect.** The rule was in both stored system prompts; the model's reasoning never mentions
+  skills, it made no skills call, the marker line is still missing and the WARN line is still missed.
+- Conclusion: for qwen3.6 a prompt rule doesn't make it look up skills; only harness-side injection (preload) has
+  worked. Next candidate: match the task against skill descriptions in the harness and preload the best match.
+
+## Follow-up: no prompts below the workdir, claim check in every subdir
+
+User request: the agent shouldn't need permission for files below its work directory, and the "claimed files
+exist" finish check should look in directories below the workspace.
+
+What still prompted, although `safe_path` already let file tools through anywhere below the workdir:
+- `run_bash` boundary patterns (`cd /…`, `cp … /home/…`, `> /home/…`, `/mnt/c/…`) matched absolute paths that
+  point *into* the workdir. Under WSL with a workdir on `/mnt/c/…` almost any absolute path asked.
+  Fix: `safety.fold_inside_paths` replaces absolute / `~` / drive-letter paths that resolve (realpath, so `..`
+  and symlinks fold first) inside the workdir or a granted dir with `.` before the patterns run. Sensitive paths
+  are not folded, and `cd <wd>/..` still resolves outside, so it still asks.
+- Reads of sensitive-named files (`credentials.json`, `.env`) inside the workdir asked. Now they don't, unless the
+  workdir is the home dir or above it (`workdir_covers_home`), where `~/.ssh` would otherwise count as inside.
+  Sensitive writes are still always refused.
+
+Claim check (`missing_files_in_text`): the basename walk used `SKIP_DIRS`, which skips `build/`, `dist/` and every
+dot dir, so files written there were "missing". It now walks with `CLAIM_SKIP_DIRS` (only `.git`, `.finch`,
+`node_modules`, `__pycache__`, `.venv`, `venv`; `.finch` holds backups, which aren't deliverables). Absolute
+claimed paths used to be mangled by `strip("./")`; now they're checked directly if they're inside the workdir.
+
+Tests: 221. Live (qwen3.6, headless so any prompt = refusal): `cd <abs wd>/build && … && cp … <abs wd>/build/x`,
+summary naming `build/greet.txt` and `greet2.txt`. No gate refusal, no claim rejection, only the usual self-check.
+

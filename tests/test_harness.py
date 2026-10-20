@@ -105,6 +105,37 @@ def test_salvage_rejects_prose():
     assert H.try_parse_tool_calls('{"foo": {"a": 1}}', KNOWN) is None
 
 
+@pytest.mark.parametrize("text,name,args", [
+    ('{ "action": "list_dir", "path": "."}', "list_dir", {"path": "."}),
+    ('{"function": "run_python", "arguments": {"code": "print(1)"}}', "run_python", {"code": "print(1)"}),
+    ('{ "function": "read_file", "arguments": { "path": "s.csv", "end_line": None } }', "read_file",
+     {"path": "s.csv", "end_line": None}),
+    ('{"tool": "finish", "summary": "said None, True"}', "finish", {"summary": "said None, True"}),
+])
+def test_loose_salvage(text, name, args):
+    assert H.try_parse_tool_calls(text, KNOWN) is None
+    assert H.try_parse_tool_calls(text, KNOWN, loose=True) == [(name, args)]
+
+
+def test_loose_salvage_rejects_unknown_names():
+    assert H.try_parse_tool_calls('{"action": "add", "items": ["x"]}', KNOWN, loose=True) is None
+    assert H.try_parse_tool_calls('{"name": "Bob", "age": 3}', KNOWN, loose=True) is None
+
+
+def test_trick_loose_salvage_runs_action_calls(tmp_path):
+    reply = ['{"action": "create_file", "path": "o.txt", "content": "x"}'] * 3
+    a, llm = make_agent(tmp_path, reply)
+    a.s.set_trick("repeat_detect", False)
+    a.run_turn("write o.txt with an x in it")
+    assert (tmp_path / "o.txt").read_text() == "x"
+    (tmp_path / "off").mkdir()
+    b, llm = make_agent(tmp_path / "off", reply)
+    b.s.set_trick("loose_salvage", False)
+    b.s.set_trick("repeat_detect", False)
+    b.run_turn("write o.txt with an x in it")
+    assert not (tmp_path / "off" / "o.txt").exists()
+
+
 def test_semantically_empty():
     assert H.semantically_empty("<think>\n\n</think>")
     assert H.semantically_empty("<think>half a thought")
@@ -148,6 +179,7 @@ def test_alias_and_arg_alias(tmp_path):
     tb = box(tmp_path)
     assert "created" in tb.run("write_file", {"file_path": "w.txt", "text": "hi"})
     assert (tmp_path / "w.txt").read_text() == "hi"
+    assert "hi" in tb.run("execute_shell", {"command": "echo hi"})     # gemma4:12b's name for run_bash
 
 
 def test_crawl_guard_throttles_never_refuses(tmp_path):
@@ -172,6 +204,17 @@ def test_bash_snapshot_before_sed(tmp_path):
     (tmp_path / "c.txt").write_text("hello")
     tb.run("run_bash", {"command": "sed -i 's/hello/bye/' c.txt"})
     assert (tmp_path / ".finch/backups/c.txt.bak").read_text() == "hello"
+
+
+def test_bash_snapshot_ignores_null_redirects(tmp_path):
+    tb = box(tmp_path)
+    (tmp_path / "app.py").write_text("x = 1")
+    r = tb.run("run_bash", {"command": 'find . -name "app.py" 2>/dev/null; ls app.py >&2 2>&1'})
+    assert "auto-backup" not in r and not (tmp_path / ".finch/backups/app.py.bak").exists()
+    r = tb.run("run_bash", {"command": "echo y > app.py 2>/dev/null"})
+    assert "auto-backup" in r and (tmp_path / ".finch/backups/app.py.bak").read_text() == "x = 1"
+    tb.s.set_trick("quiet_redirects", False)
+    assert "auto-backup" in tb.run("run_bash", {"command": 'find . -name "app.py" 2>/dev/null'})
 
 
 def test_bash_timeout_kills_tree(tmp_path):
@@ -513,6 +556,19 @@ def test_custom_system_prompt_modes(tmp_path):
     assert "Always cite" not in a.system_prompt(True)             # chat keeps its own prompt
     a.s.soul = "pirate"
     assert a.system_prompt(False).startswith("# Soul (pirate)")
+
+
+def test_system_prompt_date_and_skill_first(tmp_path):
+    a, _ = make_agent(tmp_path, [])
+    today = time.strftime("%Y-%m-%d")
+    assert all(f"Today: {today}" in a.system_prompt(qa) for qa in (False, True))
+    rule = "load the skill that fits it if the skills tool lists one"
+    assert rule in a.system_prompt(False) and rule not in a.system_prompt(True)
+    a.s.set_trick("skill_first", False)
+    assert rule not in a.system_prompt(False) and "first call todo(action=create)" in a.system_prompt(False)
+    a.s.set_trick("skill_first", True)
+    a.s.tools_off = list(a.s.tools_off or []) + ["skills"]
+    assert rule not in a.system_prompt(False)
 
 
 def test_system_prompt_persisted(tmp_path):
@@ -1331,7 +1387,7 @@ def test_settings_tools_and_skills_tabs(tmp_path, skills_home):
     assert "Skills" in "".join(t for _, t in m.render())
     m.tab = SM.GENERAL
     nav = {it.key: it.get() for it in m.items() if it.kind == "nav"}
-    assert nav["_nav_tools"] == f"0/{len(T.ALL_BUILTIN)} on" and nav["_nav_skills"].startswith("5/")
+    assert nav["_nav_tools"] == f"0/{len(T.ALL_BUILTIN)} on" and nav["_nav_skills"].startswith(f"{len(T.skill_infos(str(tmp_path))) - 1}/")
 
 
 # ---------------- settings profiles ----------------
@@ -1417,6 +1473,46 @@ def test_skill_index_caps_long_catalogs(tmp_path, skills_home):
     desc = T.skills_def(str(tmp_path))["function"]["description"]
     extra = len(T.skill_infos(str(tmp_path))) - T.SKILL_INDEX_MAX
     assert desc.count("; ") == T.SKILL_INDEX_MAX and desc.endswith(f"+{extra} more (action=list)")
+
+
+def test_skill_requires_hides_unusable_skills(tmp_path, skills_home):
+    a, _ = make_agent(tmp_path, [])
+    assert "delegate" in a._tool_def("skills")["function"]["description"]
+    child = T.ToolBox(a.s, a.gate, str(tmp_path))                  # a subagent's toolbox: no spawner
+    assert "delegate" in child.hidden_skills() and "delegate" not in child.run("skills", {"action": "list"})
+    assert "can't be used here" in child.run("skills", {"name": "delegate"})
+    a.s.offline = True
+    assert "web_research" in a.tb.hidden_skills()
+    a.s.offline = False
+    a.s.set_tool("spawn_agent", False)
+    assert "delegate (" not in a._tool_def("skills")["function"]["description"]
+    assert a.tb.run("skills", {"name": "bug_fix"}).startswith("### SKILL: bug_fix")
+
+
+def test_skill_preload_puts_delegate_into_subagent_tasks(tmp_path, skills_home):
+    a, llm = make_agent(tmp_path, [("spawn_agent", {"task": "delegate nothing, just list the files"}),
+                                   ("list_dir", {"path": "."})])
+    a.run_turn("use subagents to summarise the reports")
+    first = [m["content"] for m in llm.calls[0] if m["role"] == "user"][-1]
+    assert "### SKILL: delegate" in first and first.startswith("use subagents to summarise")
+    child = [m["content"] for m in llm.calls[1] if m["role"] == "user"][-1]
+    assert "SKILL" not in child                                       # requires spawn_agent: hidden in a child
+    a2, llm2 = make_agent(tmp_path, [])
+    a2.run_turn("write hello.txt")
+    assert "SKILL" not in [m["content"] for m in llm2.calls[0] if m["role"] == "user"][-1]
+    a3, llm3 = make_agent(tmp_path, [])
+    a3.s.set_trick("skill_preload", False)
+    a3.run_turn("use subagents to summarise the reports")
+    assert "SKILL" not in [m["content"] for m in llm3.calls[0] if m["role"] == "user"][-1]
+
+
+def test_builtin_skills_stay_small():
+    """Every byte of the index is prefill on every turn, and small models follow short checklists best."""
+    builtin = [i for i in T.skill_infos("/nonexistent") if i["scope"] == "built-in"]
+    assert len(builtin) < T.SKILL_INDEX_MAX          # room left for the user's own skills
+    for i in builtin:
+        assert 0 < len(i["desc"]) <= 80, i["name"]  # skills_def cuts descriptions at 80
+        assert len(T.read_text(i["path"])) <= 1000, i["name"]
 
 
 def test_create_import_edit_delete_skills(tmp_path, skills_home):
@@ -1573,3 +1669,43 @@ def test_subagent_prose_reply_is_steered_to_finish(tmp_path):
     assert any("only receives finish(summary)" in str(m.get("content")) for m in llm.calls[3])
     res = next(m["content"] for m in a.session.messages if m.get("tool_name") == "spawn_agent")
     assert "a.txt contains the word hello" in res
+
+
+def test_missing_files_looks_below_workdir(tmp_path):
+    for d in ("build", "dist", ".out", "a/b/c"):
+        (tmp_path / d).mkdir(parents=True)
+    (tmp_path / "build" / "app.js").write_text("x")
+    (tmp_path / "dist" / "pkg.toml").write_text("x")
+    (tmp_path / ".out" / "notes.md").write_text("x")
+    (tmp_path / "a/b/c" / "deep.csv").write_text("x")
+    (tmp_path / ".finch").mkdir()
+    (tmp_path / ".finch" / "ghost.md").write_text("x")       # a backup is not a deliverable
+    text = (f"wrote build/app.js, pkg.toml, .out/notes.md, {tmp_path / 'a/b/c/deep.csv'}, ghost.md "
+            f"and /etc/hostname.txt")
+    assert T.missing_files_in_text(text, str(tmp_path)) == ["etc/hostname.txt", "ghost.md"]
+
+
+def test_bash_paths_inside_workdir_need_no_confirmation(tmp_path):
+    s = settings(unattended=False)
+    asked = []
+    g = Gate(s, confirm=lambda *a: asked.append(a) or "no")
+    (tmp_path / "sub").mkdir()
+    wd = str(tmp_path)
+    for cmd in (f"cd {wd}/sub && ls", f"cp a.txt {wd}/sub/b.txt", f"echo hi > {wd}/sub/x.txt",
+                f'cd "{wd}" && python3 x.py'):
+        assert g.check("run_bash", {"command": cmd}, wd) is None, cmd
+    assert not asked
+    for cmd in (f"cd {wd}/..", f"cd {wd}/sub && cd ..", "cp a.txt /etc/x", f"cat {wd}/../other/.ssh/id"):
+        assert g.check("run_bash", {"command": cmd}, wd), cmd
+    assert len(asked) == 4
+
+
+def test_sensitive_read_inside_workdir_needs_no_confirmation(tmp_path):
+    s = settings(unattended=False)
+    asked = []
+    g = Gate(s, confirm=lambda *a: asked.append(a) or "no")
+    (tmp_path / "credentials.json").write_text("{}")
+    assert g.check("read_file", {"path": "credentials.json"}, str(tmp_path)) is None
+    assert g.check("create_file", {"path": "credentials.json"}, str(tmp_path))      # writes still refused
+    assert g.check("read_file", {"path": os.path.expanduser("~/.ssh/id_rsa")}, str(tmp_path))
+    assert len(asked) == 1

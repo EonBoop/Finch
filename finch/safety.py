@@ -58,6 +58,8 @@ BASH_ESCAPE = (
     r">\s*(~|/home/|/etc/|/usr/)", r"\btee\s+(-a\s+)?(~|/home/|/etc/|/usr/)",
     r"\bsudo\b", r"(^|\s)/mnt/[a-z]/",
 )
+# absolute, ~ or drive-letter paths in a shell command (not the tail of a relative path like a/b or ../b)
+ABS_PATH_RE = re.compile(r"""(?<![\w.~/\\])(~[^\s'"`;&|<>()]*|/[^\s'"`;&|<>()]+|[a-zA-Z]:[\\/][^\s'"`;&|<>()]*)""")
 FILE_TOOLS = ("create_file", "read_file", "edit_file", "append_file", "delete_file",
               "list_dir", "search_files")
 WRITE_TOOLS = ("create_file", "edit_file", "append_file", "delete_file")
@@ -100,6 +102,25 @@ def delete_targets(cmd):
             continue
         out.append(t)
     return out
+
+
+def fold_inside_paths(cmd, workdir, allow_dirs=()):
+    """Replace absolute paths that resolve inside the workdir with '.', so the boundary
+    patterns only see what really points outside. Sensitive paths are left alone."""
+    def sub(m):
+        real, inside = safe_path(workdir, m.group(0), allow_dirs)
+        return "." if inside and not is_sensitive(real) else m.group(0)
+    return ABS_PATH_RE.sub(sub, cmd)
+
+
+def workdir_covers_home(workdir):
+    """True when the workdir is the home dir or above it (~/.ssh etc. would count as "inside")."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    base = os.path.realpath(workdir)
+    try:
+        return os.path.commonpath([base, home]) == base
+    except ValueError:
+        return False
 
 
 class Gate:
@@ -171,8 +192,9 @@ class Gate:
                     if r:
                         return r
                 if name == "run_bash" and name not in self.allow_all and self.s.on("boundary_confirm"):
+                    folded = " ".join(fold_inside_paths(cmd, workdir, self.allow_dirs).lower().split())
                     for pat in BASH_ESCAPE:
-                        if re.search(pat, low):
+                        if re.search(pat, folded):
                             ok, msg = self.ask(name, cmd[:120], "run a command that reaches outside the workdir")
                             return None if ok else msg
                 return None
@@ -187,6 +209,8 @@ class Gate:
                 if is_sensitive(real):
                     if name in WRITE_TOOLS:
                         return f"[safety gate: {real} matches a sensitive pattern; writes are always refused.]"
+                    if inside and not workdir_covers_home(workdir):
+                        return None         # the user put it in the project: reading it needs no prompt
                     if name not in self.allow_all and self.s.on("boundary_confirm"):
                         ok, msg = self.ask(name, real, "read a sensitive file")
                         return None if ok else msg

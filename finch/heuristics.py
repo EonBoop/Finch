@@ -212,11 +212,36 @@ def _parse_func_expr(c, known):
     return [(name, args)]
 
 
-def try_parse_tool_calls(content, known):
+_PY_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\b(None|True|False)\b')
+_LOOSE_NAME_KEYS = ("function", "action", "tool", "name")
+_ARG_KEYS = ("arguments", "parameters", "args")
+
+
+def _json_pyish(c):
+    """JSON with Python literals (None/True/False outside strings), as lfm2.5 and hermes3 write it."""
+    lit = {"None": "null", "True": "true", "False": "false"}
+    try:
+        return json.loads(_PY_LITERAL_RE.sub(lambda m: lit[m.group(1)] if m.group(1) else m.group(0), c))
+    except Exception:
+        return None
+
+
+def _loose_call(it):
+    """{"action": "list_dir", "path": "."} / {"function": "read_file", "arguments": {..}}: the name under
+    another key, the arguments nested or flat beside it."""
+    for k in _LOOSE_NAME_KEYS:
+        if isinstance(it.get(k), str):
+            nested = next((it[a] for a in _ARG_KEYS if isinstance(it.get(a), dict)), None)
+            return it[k], nested if nested is not None else {x: v for x, v in it.items() if x != k}
+    return None
+
+
+def try_parse_tool_calls(content, known, loose=False):
     """Small models often write the tool call as text instead of a real tool_call.
     Accepts: {"name":..,"arguments":..} / {"tool":{..}} / lists of those / ```json fences /
     <tool_call> tags / gemma-style call:name{...} / placeholder-quote name(k:<|"|>v<|"|>) /
-    a bare name(k="v") expression. Unknown names are rejected."""
+    a bare name(k="v") expression. loose also takes the name under "action"/"function"/"tool"
+    with flat arguments, and Python literals. Unknown names are rejected."""
     c = (content or "").strip()
     if not c:
         return None
@@ -232,7 +257,7 @@ def try_parse_tool_calls(content, known):
         try:
             data = json.loads(c)
         except Exception:
-            data = None
+            data = _json_pyish(c) if loose else None
         if data is not None:
             calls = []
             for it in (data if isinstance(data, list) else [data]):
@@ -255,10 +280,11 @@ def try_parse_tool_calls(content, known):
                         except Exception:
                             a = {}
                     calls.append((fn.get("name", ""), a))
-                elif len(it) == 1:
+                elif len(it) == 1 and isinstance(next(iter(it.values())), dict):
                     n = next(iter(it))
-                    if isinstance(it[n], dict):
-                        calls.append((n, it[n]))
+                    calls.append((n, it[n]))
+                elif loose and _loose_call(it):
+                    calls.append(_loose_call(it))
             calls = [(n, a) for n, a in calls if n in known or "." in str(n)]
             if calls:
                 return calls
